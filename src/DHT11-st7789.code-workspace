@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "../../DHT11-st7789"
+		},
+		{
+			"name": "test_chinese",
+			"path": "../../test_chinese"
+		},
+		{
+			"name": "ESP32_1306",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}

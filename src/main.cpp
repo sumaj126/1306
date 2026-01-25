@@ -178,19 +178,19 @@ void handleRoot() {
   html += "</style>\n";                                    // CSS样式结束
   html += "<script>\n";                                    // JavaScript开始
 
-  // 自动刷新页面（每3秒刷新一次）
-  html += "setTimeout(function(){location.reload();}, 3000);\n";  // 3秒后自动刷新
+  // 自动刷新页面（每5秒刷新一次）
+  html += "setTimeout(function(){location.reload();}, 5000);\n";  // 5秒后自动刷新
   html += "</script>\n";                                   // JavaScript结束
   html += "</head>\n<body>\n";                             // head结束，body开始
   html += "<div class=\"container\">\n";                   // 容器开始
 
   // 网页内容
   html += "<div class=\"icon\">🌡️</div>\n";                // 温度计图标
-  html += "<h1>实时温度监控</h1>\n";                       // 主标题
+  html += "<h1>老苏书房实时温度</h1>\n";                       // 主标题
   html += "<div class=\"date\">" + String(currentDate) + "</div>\n";  // 显示日期
   html += "<div class=\"time\">" + String(currentTime) + "</div>\n";  // 显示时间
   html += "<div class=\"temperature\">" + String(currentTemperature, 1) + "<span class=\"unit\">°C</span></div>\n";  // 显示温度
-  html += "<div class=\"refresh-info\">页面每3秒自动刷新</div>\n";    // 刷新提示
+  html += "<div class=\"refresh-info\">页面每5秒自动刷新</div>\n";    // 刷新提示
 
   html += "</div>\n";                                      // 容器结束
   html += "</body>\n</html>\n";                            // body结束，HTML结束

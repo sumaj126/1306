@@ -19,13 +19,14 @@
  */
 
 // ==================== 头文件包含 ====================
-#include <U8g2lib.h>                   // U8g2字体库，提供丰富的字体支持
-#include <Wire.h>                      // I2C通信库，用于OLED显示屏
-#include <OneWire.h>                   // OneWire单总线通信协议库，用于DS18B20
-#include <DallasTemperature.h>         // Dallas温度传感器库，封装了DS18B20的操作
+#include <U8g2lib.h>                   // U8g2字体库,提供丰富的字体支持
+#include <Wire.h>                      // I2C通信库,用于OLED显示屏
+#include <OneWire.h>                   // OneWire单总线通信协议库,用于DS18B20
+#include <DallasTemperature.h>         // Dallas温度传感器库,封装了DS18B20的操作
 #include <WiFi.h>                      // ESP32 WiFi功能库
-#include <WebServer.h>                 // ESP32 Web服务器库，用于创建HTTP服务器
-#include <time.h>                      // C标准时间库，用于时间处理
+#include <WebServer.h>                 // ESP32 Web服务器库,用于创建HTTP服务器
+#include <time.h>                      // C标准时间库,用于时间处理
+#include <esp_task_wdt.h>              // ESP32看门狗库
 
 // ==================== OLED显示屏配置 ====================
 // 使用SSD1306驱动，I2C协议，完整帧缓冲模式
@@ -69,17 +70,138 @@ char currentTime[32] = "";                // 存储当前时间字符串
 char currentDate[32] = "";               // 存储当前日期字符串
 bool firstDataReady = false;             // 标记是否已获取到第一组数据
 
+// ==================== 系统保护变量 ====================
+unsigned long lastWiFiCheck = 0;         // 上次检查WiFi的时间
+unsigned long lastNTPCheck = 0;          // 上次检查NTP的时间
+const unsigned long wifiCheckInterval = 30000;  // WiFi检查间隔（30秒）
+const unsigned long ntpCheckInterval = 600000;  // NTP检查间隔（10分钟）
+int reconnectCount = 0;                  // WiFi重连次数
+const int maxReconnectCount = 5;         // 最大重连次数后重启
+
+// ==================== WiFi重连函数 ====================
 /**
- * 居中显示文本函数（U8g2版本）
- * @param text 要显示的文本字符串
- * @param y 垂直位置（像素坐标）
- * @param font 字体指针
- *
- * 原理：
- * - 使用U8g2的getUTF8Width获取文本的精确宽度
- * - 计算水平居中位置：(屏幕宽度 - 文本宽度) / 2
- * - 使用drawStr显示文本
+ * 检查并恢复WiFi连接
+ * 如果WiFi断开,尝试重新连接
+ * 重连失败超过maxReconnectCount次则重启ESP32
  */
+void checkWiFiConnection() {
+  unsigned long currentMillis = millis();
+  
+  // 每隔30秒检查一次WiFi状态
+  if(currentMillis - lastWiFiCheck >= wifiCheckInterval) {
+    lastWiFiCheck = currentMillis;
+    
+    // 检查WiFi是否连接
+    if(WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi disconnected! Attempting to reconnect...");
+      
+      // OLED显示重连状态
+      display.clearBuffer();
+      display.setFont(u8g2_font_ncenB08_tr);
+      display.drawStr(0, 15, "WiFi Lost!");
+      String retryStr = "Retry: " + String(reconnectCount + 1);
+      display.drawStr(0, 30, retryStr.c_str());
+      display.sendBuffer();
+      
+      // 尝试重新连接
+      WiFi.disconnect();
+      WiFi.begin(ssid, password);
+      
+      // 等待连接（最多10秒）
+      int retryTimeout = 10;
+      while(WiFi.status() != WL_CONNECTED && retryTimeout > 0) {
+        delay(1000);
+        retryTimeout--;
+        Serial.print(".");
+      }
+      
+      if(WiFi.status() == WL_CONNECTED) {
+        // 重连成功
+        Serial.println("\nWiFi reconnected!");
+        Serial.print("IP: ");
+        Serial.println(WiFi.localIP());
+        reconnectCount = 0;  // 重置重连计数
+        
+        // 重新配置静态IP
+        if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
+          Serial.println("Static IP configuration failed after reconnect");
+        }
+      } else {
+        // 重连失败
+        Serial.println("\nWiFi reconnect failed!");
+        reconnectCount++;
+        
+        // 超过最大重连次数,重启ESP32
+        if(reconnectCount >= maxReconnectCount) {
+          Serial.println("Max reconnect attempts reached. Restarting ESP32...");
+          display.clearBuffer();
+          display.setFont(u8g2_font_ncenB08_tr);
+          display.drawStr(0, 15, "WiFi Failed!");
+          display.drawStr(0, 30, "Restarting...");
+          display.sendBuffer();
+          delay(2000);
+          ESP.restart();  // 重启ESP32
+        }
+      }
+    } else {
+      // WiFi正常,重置重连计数
+      reconnectCount = 0;
+    }
+  }
+}
+
+// ==================== NTP时间同步函数 ====================
+/**
+ * 检查并同步NTP时间
+ * 每10分钟同步一次时间,防止时间漂移
+ */
+void checkNTPSync() {
+  unsigned long currentMillis = millis();
+  
+  // 每隔10分钟检查一次NTP同步
+  if(currentMillis - lastNTPCheck >= ntpCheckInterval) {
+    lastNTPCheck = currentMillis;
+    
+    // 重新配置时间同步
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    
+    struct tm timeinfo;
+    if(getLocalTime(&timeinfo)) {
+      Serial.println("NTP time sync successful");
+    } else {
+      Serial.println("NTP time sync failed");
+    }
+  }
+}
+
+// ==================== 内存监控函数 ====================
+/**
+ * 监控ESP32剩余内存
+ * 如果内存不足,输出警告信息
+ */
+void checkMemory() {
+  unsigned long freeHeap = ESP.getFreeHeap();
+  unsigned long minFreeHeap = ESP.getMinFreeHeap();
+  
+  if(freeHeap < 30000) {  // 如果剩余内存小于30KB
+    Serial.print("WARNING: Low memory! Free: ");
+    Serial.print(freeHeap);
+    Serial.print(" bytes, Min: ");
+    Serial.print(minFreeHeap);
+    Serial.println(" bytes");
+    
+    // OLED显示内存警告
+    display.clearBuffer();
+    display.setFont(u8g2_font_ncenB08_tr);
+    display.drawStr(0, 15, "Low Memory!");
+    String memStr = "Free: " + String(freeHeap / 1024) + "KB";
+    display.drawStr(0, 30, memStr.c_str());
+    display.sendBuffer();
+    delay(2000);
+  }
+}
+
+// ==================== 居中显示文本函数（U8g2版本）====================
 void printCentered(const char* text, int16_t y, const uint8_t* font) {
   display.setFont(font);                                   // 设置字体
   int16_t textWidth = display.getUTF8Width(text);         // 获取文本宽度（支持中文）
@@ -178,19 +300,19 @@ void handleRoot() {
   html += "</style>\n";                                    // CSS样式结束
   html += "<script>\n";                                    // JavaScript开始
 
-  // 自动刷新页面（每5秒刷新一次）
-  html += "setTimeout(function(){location.reload();}, 5000);\n";  // 5秒后自动刷新
+  // 自动刷新页面（每3秒刷新一次）
+  html += "setTimeout(function(){location.reload();}, 3000);\n";  // 3秒后自动刷新
   html += "</script>\n";                                   // JavaScript结束
   html += "</head>\n<body>\n";                             // head结束，body开始
   html += "<div class=\"container\">\n";                   // 容器开始
 
   // 网页内容
   html += "<div class=\"icon\">🌡️</div>\n";                // 温度计图标
-  html += "<h1>老苏书房实时温度</h1>\n";                       // 主标题
+  html += "<h1>实时温度监控</h1>\n";                       // 主标题
   html += "<div class=\"date\">" + String(currentDate) + "</div>\n";  // 显示日期
   html += "<div class=\"time\">" + String(currentTime) + "</div>\n";  // 显示时间
   html += "<div class=\"temperature\">" + String(currentTemperature, 1) + "<span class=\"unit\">°C</span></div>\n";  // 显示温度
-  html += "<div class=\"refresh-info\">页面每5秒自动刷新</div>\n";    // 刷新提示
+  html += "<div class=\"refresh-info\">页面每3秒自动刷新</div>\n";    // 刷新提示
 
   html += "</div>\n";                                      // 容器结束
   html += "</body>\n</html>\n";                            // body结束，HTML结束
@@ -268,6 +390,11 @@ void setup() {
   sensors.begin();                                         // 启动DS18B20传感器
   Serial.println("DS18B20 initialized");                   // 输出传感器初始化成功信息
 
+  // ==================== 启动看门狗 ====================
+  // 启用任务看门狗,超时时间30秒
+  esp_task_wdt_init(30, true);                             // 30秒超时,panic模式(系统重启)
+  Serial.println("Watchdog enabled (30s timeout)");
+
   // 连接WiFi网络
   WiFi.begin(ssid, password);                             // 开始连接WiFi
 
@@ -275,6 +402,7 @@ void setup() {
   while(WiFi.status() != WL_CONNECTED) {                   // 循环等待WiFi连接成功
     delay(500);                                            // 延迟500毫秒
     Serial.print(".");                                     // 打印一个点表示等待中
+    esp_task_wdt_reset();                                  // 喂狗,防止看门狗超时
 
     // 在OLED上显示连接进度
     display.clearBuffer();                                 // 清空缓冲区
@@ -324,6 +452,8 @@ void setup() {
 
   display.clearBuffer();                                  // 清空OLED准备进入主循环显示
   display.sendBuffer();                                   // 更新OLED
+  
+  Serial.println("System ready. Watchdog running.");
 }
 
 /**
@@ -331,6 +461,16 @@ void setup() {
  * 程序启动后无限循环执行，用于持续读取和显示数据，并处理Web请求
  */
 void loop() {
+  // ==================== 喂看门狗 ====================
+  esp_task_wdt_reset();                                    // 重置看门狗计时器,防止系统重启
+                                                            // 必须在30秒内调用一次
+  
+  // ==================== 系统保护检查 ====================
+  checkWiFiConnection();                                   // 检查并恢复WiFi连接
+  checkNTPSync();                                         // 定期同步NTP时间
+  checkMemory();                                           // 监控剩余内存
+
+  // ==================== 获取时间 ====================
   struct tm timeinfo;                                      // 定义时间结构体变量
                                                             // tm结构体包含年、月、日、时、分、秒等字段
 
@@ -338,9 +478,11 @@ void loop() {
   // getLocalTime()会从NTP服务器获取时间并填充到timeinfo结构体
   if(!getLocalTime(&timeinfo)) {                          // 如果获取时间失败
     Serial.println("Failed to obtain time");              // 输出错误信息
+    delay(1000);                                           // 等待1秒后重试
     return;                                                // 跳过本次循环，等待下次重试
   }
 
+  // ==================== 读取温度 ====================
   // 请求温度传感器读取温度
   sensors.requestTemperatures();                           // 发送温度转换命令给DS18B20
   float temperature = sensors.getTempCByIndex(0);         // 读取第0个传感器的温度（摄氏度）
@@ -358,6 +500,7 @@ void loop() {
     return;                                                // 跳过本次循环
   }
 
+  // ==================== 更新全局变量 ====================
   // 更新全局变量（供Web服务器使用）
   currentTemperature = temperature;                       // 保存当前温度值
   sprintf(currentTime, "%02d:%02d:%02d",                    // 格式化时间字符串
@@ -366,6 +509,7 @@ void loop() {
           timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
   firstDataReady = true;                                    // 标记数据已准备就绪
 
+  // ==================== OLED显示 ====================
   // 清空显示屏缓冲区（U8g2版本）
   display.clearBuffer();                                  // 清空所有待显示的内容
                                                             // 注意：此时OLED屏幕还没变，需要调用sendBuffer()才更新
@@ -393,18 +537,19 @@ void loop() {
   display.sendBuffer();                                   // 将缓冲区的所有内容发送到OLED屏幕显示
                                                             // 此时用户才能看到屏幕上的内容
 
-  // ========== 输出到串口（调试用） ==========
+  // ==================== 串口输出（调试用） ====================
   Serial.print("Time: ");                                  // 打印"Time: "
   Serial.print(timeStr);                                   // 打印时间字符串，如"14:30:45"
   Serial.print("  Temp: ");                               // 打印"  Temp: "
   Serial.print(temperature, 2);                           // 打印温度值，保留2位小数，如"25.37"
-  Serial.println(" C");                                    // 打印" C"并换行
+  Serial.print(" C  WiFi: ");                             // 打印WiFi状态
+  Serial.println(WiFi.status() == WL_CONNECTED ? "OK" : "LOST");  // 打印WiFi连接状态
 
-  // ========== 处理Web请求 ==========
+  // ==================== 处理Web请求 ====================
   server.handleClient();                                   // 处理来自客户端的HTTP请求
                                                             // 这个函数需要频繁调用，以确保及时响应客户端
 
-  // ========== 等待1秒后继续循环 ==========
+  // ==================== 等待1秒后继续循环 ====================
   delay(1000);                                             // 延迟1000毫秒（1秒）
                                                             // 这样每秒更新一次显示
 }

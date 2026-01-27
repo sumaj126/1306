@@ -1,28 +1,28 @@
 /**
- * ESP32 + DS18B20 + OLED 0.96寸(SSD1306) 温度时间显示项目 + Web服务器
+ * ESP32 + DHT20 + OLED 0.96寸(SSD1306) 温湿度时间显示项目 + Web服务器
  * 使用U8g2字体库，支持更多字体和语言
  * 功能：
  * 1. 从NTP服务器获取网络时间
- * 2. 从DS18B20读取温度
- * 3. 在OLED屏幕上居中显示时间和温度（使用U8g2精美字体）
- * 4. 启动Web服务器，手机可通过浏览器访问ESP32查看温度和时间
+ * 2. 从DHT20读取温度和湿度
+ * 3. 在OLED屏幕上居中显示时间、温度和湿度（使用U8g2精美字体）
+ * 4. 启动Web服务器，手机可通过浏览器访问ESP32查看温度、湿度和时间
  *
  * 硬件连接：
  * - OLED (I2C): VCC->3.3V, GND->GND, SCL->GPIO22, SDA->GPIO21
- * - DS18B20: VCC->3.3V, GND->GND, DATA->GPIO4 (需4.7K上拉电阻到3.3V)
+ * - DHT20 (I2C): VCC->3.3V, GND->GND, SCL->GPIO22, SDA->GPIO21 (与OLED共用I2C总线)
  *
  * 使用方法：
  * 1. 连接WiFi后，OLED会显示ESP32的IP地址
- * 2. 在手机浏览器输入该IP地址即可查看温度
+ * 2. 在手机浏览器输入该IP地址即可查看温度和湿度
  * 3. 访问 http://IP地址/temperature 可获取纯文本温度数据
- * 4. 访问 http://IP地址/json 可获取JSON格式数据
+ * 4. 访问 http://IP地址/humidity 可获取纯文本湿度数据
+ * 5. 访问 http://IP地址/json 可获取JSON格式数据
  */
 
 // ==================== 头文件包含 ====================
 #include <U8g2lib.h>                   // U8g2字体库,提供丰富的字体支持
-#include <Wire.h>                      // I2C通信库,用于OLED显示屏
-#include <OneWire.h>                   // OneWire单总线通信协议库,用于DS18B20
-#include <DallasTemperature.h>         // Dallas温度传感器库,封装了DS18B20的操作
+#include <Wire.h>                      // I2C通信库,用于OLED和DHT20显示屏
+#include <Adafruit_AHTX0.h>            // AHT20温湿度传感器库（支持DHT20）
 #include <WiFi.h>                      // ESP32 WiFi功能库
 #include <WebServer.h>                 // ESP32 Web服务器库,用于创建HTTP服务器
 #include <time.h>                      // C标准时间库,用于时间处理
@@ -32,15 +32,12 @@
 // 使用SSD1306驱动，I2C协议，完整帧缓冲模式
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 
-// ==================== DS18B20引脚定义 ====================
-#define ONE_WIRE_BUS 4                  // DS18B20数据引脚连接到ESP32的GPIO4
-
-// ==================== 创建对象实例 ====================
-// 创建OneWire对象，传入数据引脚
-OneWire oneWire(ONE_WIRE_BUS);
-
-// 创建DallasTemperature对象，传入OneWire对象（用于通信）
-DallasTemperature sensors(&oneWire);
+// ==================== AHT20传感器配置 ====================
+// AHT20使用独立的I2C引脚
+#define AHT20_SDA 4     // AHT20 SDA引脚
+#define AHT20_SCL 5     // AHT20 SCL引脚
+Adafruit_AHTX0 aht;    // 创建AHT20对象
+TwoWire ahtWire = TwoWire(1);  // 创建第二个I2C实例用于AHT20
 
 // 创建Web服务器对象，监听80端口（HTTP默认端口）
 WebServer server(80);
@@ -60,12 +57,13 @@ IPAddress primaryDNS(192, 168, 1, 1);      // DNS服务器1（路由器IP）
 IPAddress secondaryDNS(8, 8, 8, 8);         // DNS服务器2（Google DNS）
 
 // ==================== NTP时间服务器配置 ====================
-const char* ntpServer = "pool.ntp.org";           // NTP服务器地址，全球时间同步服务器
+const char* ntpServer = "cn.pool.ntp.org";           // NTP服务器地址，使用国内服务器速度更快
 const long gmtOffset_sec = 8 * 3600;              // 时区偏移（秒），8小时表示东八区（北京时间）
 const int daylightOffset_sec = 0;                 // 夏令时偏移（秒），中国不使用夏令时设为0
 
 // ==================== 全局变量 ====================
 float currentTemperature = 0.0;          // 存储当前温度值（供Web服务器使用）
+float currentHumidity = 0.0;             // 存储当前湿度值（供Web服务器使用）
 char currentTime[32] = "";                // 存储当前时间字符串
 char currentDate[32] = "";               // 存储当前日期字符串
 bool firstDataReady = false;             // 标记是否已获取到第一组数据
@@ -210,65 +208,9 @@ void printCentered(const char* text, int16_t y, const uint8_t* font) {
 }
 
 /**
- * 居中显示温度函数（U8g2版本）
- * @param temp 温度值（浮点数）
- * @param y 垂直位置（像素坐标）
- * @param font 字体指针
- *
- * 原理：
- * - 将温度值格式化为字符串，保留一位小数
- * - 手动绘制度数符号（小圆圈）+ 绘制温度数值和字母C
- * - 计算总宽度后居中显示
- */
-void printTempCentered(float temp, int16_t y, const uint8_t* font) {
-  display.setFont(font);                                   // 设置字体
-
-  // 获取字体参数（必须在设置字体后调用）
-  int16_t fontAscent = display.getFontAscent();           // 字体上升部分高度
-  int16_t fontDescent = display.getFontDescent();         // 字体下降部分高度
-  int16_t fontHeight = fontAscent - fontDescent;          // 总字体高度
-
-  // 将温度格式化为字符串（保留一位小数）
-  char tempNumStr[10];                                     // 定义字符数组存储温度字符串
-  sprintf(tempNumStr, "%.1f", temp);                       // 格式化温度值，例如"25.3"
-
-  // 获取各部分的宽度
-  int16_t numWidth = display.getUTF8Width(tempNumStr);    // 数值部分宽度
-  int16_t cWidth = display.getUTF8Width("C");             // 字母C宽度
-
-  // 手动绘制度数符号的宽度（固定大小）
-  int16_t degreeWidth = 8;                                // 度数符号宽度（小圆圈）
-
-  // 定义间距（像素）
-  int16_t spacing = 2;                                    // 各部分之间的间距
-
-  // 计算总宽度（包括间距）
-  int16_t totalWidth = numWidth + degreeWidth + cWidth + (spacing * 2);  // 总宽度 + 2个间距
-
-  // 计算起始x坐标（居中）
-  int16_t startX = (128 - totalWidth) / 2;
-
-  // 依次绘制各部分
-  int16_t currentX = startX;                              // 当前绘制位置
-
-  // 绘制温度数值
-  display.drawStr(currentX, y, tempNumStr);
-  currentX += numWidth + spacing;                          // 移动到度数符号位置
-
-  // 手动绘制度数符号（小圆圈）
-  // U8g2的drawStr中y坐标是字符的基线（底部），所以圆圈需要向上调整
-  int16_t circleCenterY = y - fontHeight / 2 - 2;         // 圆圈中心Y坐标（基于字体基线调整，再向上2像素）
-  display.drawCircle(currentX + degreeWidth / 2, circleCenterY, degreeWidth / 2 - 1);  // 绘制空心圆圈
-  currentX += degreeWidth + spacing;                       // 移动到C位置
-
-  // 绘制字母C
-  display.drawStr(currentX, y, "C");
-}
-
-/**
  * Web服务器 - 主页处理函数
  * 访问 http://ESP32_IP/ 时调用此函数
- * 返回一个美观的HTML页面，显示温度和时间信息
+ * 返回一个美观的HTML页面，显示温度、湿度和时间信息
  */
 void handleRoot() {
   // 添加CORS响应头，允许跨域访问（用于群晖反向代理）
@@ -280,7 +222,7 @@ void handleRoot() {
   html += "<html>\n<head>\n";                              // HTML开始标签
   html += "<meta charset=\"UTF-8\">\n";                     // 设置字符编码为UTF-8
   html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n";  // 适配移动端
-  html += "<title>ESP32 温度监控</title>\n";                // 网页标题
+  html += "<title>ESP32 温湿度监控</title>\n";             // 网页标题
   html += "<style>\n";                                     // CSS样式开始
 
   // 美观的CSS样式
@@ -290,7 +232,11 @@ void handleRoot() {
   html += ".container { background: white; padding: 30px; border-radius: 20px; ";  // 容器样式
   html += "box-shadow: 0 10px 40px rgba(0,0,0,0.2); max-width: 400px; width: 100%; text-align: center; }\n";  // 阴影和圆角
   html += "h1 { color: #333; margin-bottom: 10px; font-size: 28px; }\n";      // 标题样式
-  html += ".temperature { font-size: 48px; font-weight: bold; color: #e74c3c; margin: 20px 0; }\n";  // 温度大字体
+  html += ".data-row { display: flex; justify-content: space-around; margin: 20px 0; }\n";  // 数据行样式
+  html += ".data-item { flex: 1; }\n";                   // 数据项样式
+  html += ".data-value { font-size: 48px; font-weight: bold; margin: 10px 0; }\n";  // 数据值大字体
+  html += ".data-label { font-size: 14px; color: #888; }\n";  // 数据标签样式
+  html += ".hum-color { color: #3498db; }\n";             // 湿度颜色
   html += ".time { font-size: 24px; color: #666; margin: 10px 0; }\n";         // 时间样式
   html += ".date { font-size: 18px; color: #888; margin-bottom: 20px; }\n";    // 日期样式
   html += ".icon { font-size: 60px; margin-bottom: 10px; }\n";                 // 图标样式
@@ -300,6 +246,24 @@ void handleRoot() {
   html += "</style>\n";                                    // CSS样式结束
   html += "<script>\n";                                    // JavaScript开始
 
+  // 动态温度颜色（根据温度值）
+  html += "const temperature = " + String(currentTemperature, 1) + ";\n";
+  html += "let tempColor = '';\n";
+  html += "if (temperature < 20) {\n";
+  html += "  tempColor = '#3498db';\n";  // 蓝色（20度以下）
+  html += "} else if (temperature >= 20 && temperature < 30) {\n";
+  html += "  const ratio = (temperature - 20) / 10;\n";  // 黄色到橙色渐变
+  html += "  const r = Math.round(241 + ratio * (230 - 241));\n";
+  html += "  const g = Math.round(196 + ratio * (126 - 196));\n";
+  html += "  const b = Math.round(15 + ratio * (34 - 15));\n";
+  html += "  tempColor = 'rgb(' + r + ',' + g + ',' + b + ')';\n";
+  html += "} else {\n";
+  html += "  tempColor = '#e74c3c';\n";  // 红色（30度以上）
+  html += "}\n";
+  html += "document.addEventListener('DOMContentLoaded', function() {\n";
+  html += "  document.querySelectorAll('.temp-color').forEach(el => el.style.color = tempColor);\n";
+  html += "});\n";
+
   // 自动刷新页面（每3秒刷新一次）
   html += "setTimeout(function(){location.reload();}, 3000);\n";  // 3秒后自动刷新
   html += "</script>\n";                                   // JavaScript结束
@@ -307,11 +271,20 @@ void handleRoot() {
   html += "<div class=\"container\">\n";                   // 容器开始
 
   // 网页内容
-  html += "<div class=\"icon\">🌡️</div>\n";                // 温度计图标
-  html += "<h1>实时温度监控</h1>\n";                       // 主标题
+  html += "<div class=\"icon\">🌡️</div>\n";                // 图标
+  html += "<h1>实时温湿度监控</h1>\n";                    // 主标题
   html += "<div class=\"date\">" + String(currentDate) + "</div>\n";  // 显示日期
   html += "<div class=\"time\">" + String(currentTime) + "</div>\n";  // 显示时间
-  html += "<div class=\"temperature\">" + String(currentTemperature, 1) + "<span class=\"unit\">°C</span></div>\n";  // 显示温度
+  html += "<div class=\"data-row\">\n";                    // 数据行开始
+  html += "<div class=\"data-item\">\n";                  // 温度数据项
+  html += "<div class=\"data-value temp-color\">" + String(currentTemperature, 1) + "<span class=\"unit\">°C</span></div>\n";
+  html += "<div class=\"data-label\">温度</div>\n";        // 温度标签
+  html += "</div>\n";                                      // 温度数据项结束
+  html += "<div class=\"data-item\">\n";                  // 湿度数据项
+  html += "<div class=\"data-value hum-color\">" + String(currentHumidity, 1) + "<span class=\"unit\">%</span></div>\n";
+  html += "<div class=\"data-label\">湿度</div>\n";        // 湿度标签
+  html += "</div>\n";                                      // 湿度数据项结束
+  html += "</div>\n";                                      // 数据行结束
   html += "<div class=\"refresh-info\">页面每3秒自动刷新</div>\n";    // 刷新提示
 
   html += "</div>\n";                                      // 容器结束
@@ -337,9 +310,24 @@ void handleTemperature() {
 }
 
 /**
+ * Web服务器 - 湿度API处理函数
+ * 访问 http://ESP32_IP/humidity 时调用此函数
+ * 返回纯文本格式的湿度数据，方便其他程序读取
+ */
+void handleHumidity() {
+  // 添加CORS响应头，允许跨域访问（用于群晖反向代理）
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  String humText = String(currentHumidity, 1) + "%";       // 格式化湿度为字符串，如"65.2%"
+  server.send(200, "text/plain", humText);                 // 发送纯文本响应
+}
+
+/**
  * Web服务器 - JSON API处理函数
  * 访问 http://ESP32_IP/json 时调用此函数
- * 返回JSON格式的数据，包含温度、时间和日期
+ * 返回JSON格式的数据，包含温度、湿度、时间和日期
  */
 void handleJson() {
   // 添加CORS响应头，允许跨域访问（用于群晖反向代理）
@@ -349,9 +337,9 @@ void handleJson() {
 
   String json = "{";                                       // JSON开始
   json += "\"temperature\": " + String(currentTemperature, 1) + ",";  // 温度值
+  json += "\"humidity\": " + String(currentHumidity, 1) + ",";       // 湿度值
   json += "\"time\": \"" + String(currentTime) + "\",";     // 时间字符串
   json += "\"date\": \"" + String(currentDate) + "\",";     // 日期字符串
-  json += "\"unit\": \"C\",";                               // 温度单位
   json += "\"status\": \"ok\"";                             // 状态
   json += "}";                                              // JSON结束
 
@@ -386,9 +374,31 @@ void setup() {
   display.begin();                                          // 初始化U8g2显示屏
   display.clearBuffer();                                   // 清空显示缓冲区
 
-  // 初始化温度传感器
-  sensors.begin();                                         // 启动DS18B20传感器
-  Serial.println("DS18B20 initialized");                   // 输出传感器初始化成功信息
+  // 初始化温湿度传感器
+  ahtWire.begin(AHT20_SDA, AHT20_SCL, 400000);  // 初始化第二个I2C总线
+  if (!aht.begin(&ahtWire, 0x38)) {               // 使用自定义Wire，地址0x38
+    Serial.println("AHT20 initialization failed!");
+    display.clearBuffer();
+    display.setFont(u8g2_font_ncenB08_tr);
+    display.drawStr(0, 15, "Sensor Error!");
+    display.drawStr(0, 30, "Check AHT20");
+    display.sendBuffer();
+    delay(2000);
+  } else {
+    Serial.println("AHT20 initialized successfully");
+    Serial.print("AHT20 I2C: SDA=GPIO");
+    Serial.print(AHT20_SDA);
+    Serial.print(", SCL=GPIO");
+    Serial.println(AHT20_SCL);
+
+    // AHT20传感器预热，确保首次读取准确
+    Serial.println("AHT20 warming up...");
+    display.clearBuffer();
+    display.setFont(u8g2_font_ncenB08_tr);
+    display.drawStr(0, 15, "Sensor Warming...");
+    display.sendBuffer();
+    delay(500);  // 预热0.5秒（缩短延迟）
+  }
 
   // ==================== 启动看门狗 ====================
   // 启用任务看门狗,超时时间30秒
@@ -399,16 +409,15 @@ void setup() {
   WiFi.begin(ssid, password);                             // 开始连接WiFi
 
   Serial.print("Connecting to WiFi");                      // 串口输出连接信息
+  display.clearBuffer();                                   // 清空缓冲区
+  display.setFont(u8g2_font_ncenB08_tr);                  // 设置小字体
+  display.drawStr(0, 15, "Connecting WiFi...");           // 显示连接信息
+  display.sendBuffer();                                    // 发送到OLED显示
+
   while(WiFi.status() != WL_CONNECTED) {                   // 循环等待WiFi连接成功
     delay(500);                                            // 延迟500毫秒
     Serial.print(".");                                     // 打印一个点表示等待中
     esp_task_wdt_reset();                                  // 喂狗,防止看门狗超时
-
-    // 在OLED上显示连接进度
-    display.clearBuffer();                                 // 清空缓冲区
-    display.setFont(u8g2_font_ncenB08_tr);                // 设置小字体
-    display.drawStr(0, 15, "Connecting WiFi...");         // 显示连接信息
-    display.sendBuffer();                                  // 发送到OLED显示
   }
   Serial.println();                                        // 换行
   Serial.println("WiFi connected");                        // 输出连接成功信息
@@ -423,12 +432,37 @@ void setup() {
   String ipStr = "IP: " + WiFi.localIP().toString();      // 拼接IP地址字符串
   display.drawStr(0, 30, ipStr.c_str());                  // 显示IP地址
   display.sendBuffer();                                   // 发送到OLED
-  delay(3000);                                             // 显示3秒让用户看到IP地址
+  delay(1000);                                             // 显示1秒让用户看到IP地址（缩短延迟）
 
   // 配置网络时间同步（NTP）
   // configTime用于配置ESP32的时间同步服务
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);  // 设置时区、夏令时和NTP服务器
-  Serial.println("NTP configured");                         // 输出NTP配置成功信息
+
+  // 等待NTP时间同步成功（最多等待5秒）
+  Serial.print("Syncing NTP time...");
+  display.clearBuffer();
+  display.setFont(u8g2_font_ncenB08_tr);
+  display.drawStr(0, 15, "Syncing NTP...");
+  display.sendBuffer();
+
+  struct tm timeinfo;
+  int syncAttempts = 0;
+  const int maxSyncAttempts = 10;  // 最多尝试10次，每次延迟500ms，总共5秒
+
+  while(!getLocalTime(&timeinfo) && syncAttempts < maxSyncAttempts) {
+    Serial.print(".");
+    delay(500);
+    esp_task_wdt_reset();  // 喂狗
+    syncAttempts++;
+  }
+
+  if(getLocalTime(&timeinfo)) {
+    Serial.println("\nNTP time sync successful!");
+    Serial.print("Current time: ");
+    Serial.println(&timeinfo, "%Y-%m-%d %H:%M:%S");
+  } else {
+    Serial.println("\nNTP time sync failed, will retry in loop");
+  }
 
   // ==================== 配置静态IP ====================
   if (WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
@@ -443,6 +477,7 @@ void setup() {
   // ==================== 配置Web服务器 ====================
   server.on("/", handleRoot);                              // 注册根路径处理函数（主页）
   server.on("/temperature", handleTemperature);            // 注册温度API路径
+  server.on("/humidity", handleHumidity);                  // 注册湿度API路径
   server.on("/json", handleJson);                          // 注册JSON API路径
   server.onNotFound(handleNotFound);                       // 注册404处理函数
 
@@ -451,8 +486,10 @@ void setup() {
   Serial.println("Web server running on http://" + WiFi.localIP().toString());  // 显示服务器地址
 
   display.clearBuffer();                                  // 清空OLED准备进入主循环显示
+  display.setFont(u8g2_font_ncenB08_tr);                  // 设置字体
+  display.drawStr(0, 32, "Syncing Time...");             // 显示时间同步状态
   display.sendBuffer();                                   // 更新OLED
-  
+
   Serial.println("System ready. Watchdog running.");
 }
 
@@ -478,20 +515,33 @@ void loop() {
   // getLocalTime()会从NTP服务器获取时间并填充到timeinfo结构体
   if(!getLocalTime(&timeinfo)) {                          // 如果获取时间失败
     Serial.println("Failed to obtain time");              // 输出错误信息
-    delay(1000);                                           // 等待1秒后重试
+    // 显示同步状态
+    display.clearBuffer();
+    display.setFont(u8g2_font_ncenB08_tr);
+    display.drawStr(0, 32, "Syncing Time...");
+    display.sendBuffer();
+    delay(500);                                            // 等待0.5秒后重试
     return;                                                // 跳过本次循环，等待下次重试
   }
 
-  // ==================== 读取温度 ====================
-  // 请求温度传感器读取温度
-  sensors.requestTemperatures();                           // 发送温度转换命令给DS18B20
-  float temperature = sensors.getTempCByIndex(0);         // 读取第0个传感器的温度（摄氏度）
-                                                            // getTempCByIndex()返回摄氏度温度值
+  // ==================== 读取温湿度 ====================
+  // AHT20需要先触发测量
+  sensors_event_t humidity, temp;
+  aht.getEvent(&humidity, &temp);  // 获取温度和湿度事件
 
-  // 检查温度传感器是否正常工作
-  // DEVICE_DISCONNECTED_C是错误代码，表示传感器未连接或故障
-  if(temperature == DEVICE_DISCONNECTED_C) {              // 如果返回错误代码
-    Serial.println("Error: DS18B20 not connected!");       // 输出错误信息
+  float temperature = temp.temperature;    // 温度（摄氏度）
+  float hum = humidity.relative_humidity;  // 湿度（百分比）
+
+  // 调试输出
+  Serial.print("Temperature: ");
+  Serial.print(temperature);
+  Serial.print("°C, Humidity: ");
+  Serial.print(hum);
+  Serial.println("%");
+
+  // 检查传感器是否正常工作
+  if(isnan(temperature) || isnan(hum)) {  // 如果读取失败
+    Serial.println("Error: AHT20 reading invalid!");
     display.clearBuffer();                                 // 清空缓冲区（U8g2版本）
     display.setFont(u8g2_font_ncenB08_tr);                // 设置字体
     display.drawStr(0, 15, "Sensor Error!");               // 显示传感器错误
@@ -503,6 +553,7 @@ void loop() {
   // ==================== 更新全局变量 ====================
   // 更新全局变量（供Web服务器使用）
   currentTemperature = temperature;                       // 保存当前温度值
+  currentHumidity = hum;                               // 保存当前湿度值
   sprintf(currentTime, "%02d:%02d:%02d",                    // 格式化时间字符串
           timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
   sprintf(currentDate, "%04d-%02d-%02d",                    // 格式化日期字符串
@@ -520,18 +571,22 @@ void loop() {
            timeinfo.tm_year + 1900,                         // 年份：2025
            timeinfo.tm_mon + 1,                             // 月份：1-12
            timeinfo.tm_mday);                               // 日期：1-31
-  printCentered(dateStr, 8, u8g2_font_ncenB08_tr);        // 在y=8位置居中显示日期，使用小字体
+  printCentered(dateStr, 12, u8g2_font_ncenB08_tr);       // 在y=12位置居中显示日期，使用小字体
 
-  // ========== 显示时间（居中，大字体，屏幕正中央） ==========
+  // ========== 显示时间（居中，大字体，第二行） ==========
   char timeStr[16];                                        // 定义字符数组存储时间字符串
   sprintf(timeStr, "%02d:%02d:%02d",                       // 格式化时间为HH:MM:SS
            timeinfo.tm_hour,                                // 小时：0-23
            timeinfo.tm_min,                                 // 分钟：0-59
            timeinfo.tm_sec);                                // 秒：0-59
-  printCentered(timeStr, 36, u8g2_font_ncenB18_tr);       // 在y=36位置居中显示，使用大字体（屏幕正中央）
+  printCentered(timeStr, 38, u8g2_font_ncenB18_tr);       // 在y=38位置居中显示，使用大字体（屏幕正中央）
 
-  // ========== 显示温度（居中，中等字体） ==========
-  printTempCentered(temperature, 60, u8g2_font_ncenB14_tr);  // 在y=60位置居中显示温度，使用中等字体（接近底部）
+  // ========== 显示温湿度（居中，较小字体，第三行） ==========
+  char tempHumStr[30];                                     // 定义字符数组存储温湿度字符串
+  sprintf(tempHumStr, "%.1f\xB0""C  %.1f%%",              // 格式化温湿度字符串，\xB0是度数符号的十六进制码
+          temperature,                                     // 温度值
+          hum);                                             // 湿度值
+  printCentered(tempHumStr, 60, u8g2_font_ncenB12_tf);    // 在y=60位置居中显示温湿度，使用支持完整字符集的字体
 
   // 刷新显示屏（U8g2版本）
   display.sendBuffer();                                   // 将缓冲区的所有内容发送到OLED屏幕显示
@@ -560,20 +615,20 @@ void loop() {
  * 1. setup()只执行一次：
  *    - 初始化串口（115200波特率）
  *    - 初始化U8g2 OLED显示屏
- *    - 初始化DS18B20温度传感器
+ *    - 初始化DHT20温湿度传感器
  *    - 连接WiFi网络
  *    - 配置NTP时间服务器
  *    - 启动Web服务器（监听80端口）
  *
  * 2. loop()无限循环（每秒一次）：
  *    - 从NTP获取当前时间
- *    - 读取DS18B20温度
+ *    - 读取DHT20温湿度
  *    - 检查传感器是否正常
  *    - 更新全局变量（供Web使用）
  *    - 清空缓冲区
  *    - 居中显示日期（小字体：u8g2_font_ncenB08_tr）
- *    - 居中显示时间（中等字体：u8g2_font_ncenB14_tr）
- *    - 居中显示温度（大字体：u8g2_font_ncenB18_tr）
+ *    - 居中显示时间（中等字体：u8g2_font_ncenB12_tr）
+ *    - 居中显示温湿度（中等字体：u8g2_font_ncenB12_tr）
  *    - 刷新OLED屏幕（sendBuffer）
  *    - 处理Web服务器请求
  *    - 串口输出调试信息
@@ -581,13 +636,13 @@ void loop() {
  *
  * U8g2字体说明：
  * - u8g2_font_ncenB08_tr: 小字体（8像素高度），用于日期
- * - u8g2_font_ncenB14_tr: 中等字体（14像素高度），用于时间
- * - u8g2_font_ncenB18_tr: 大字体（18像素高度），用于温度
+ * - u8g2_font_ncenB12_tr: 中等字体（12像素高度），用于时间和温湿度
  * - 更多字体可在U8g2库文档中查找
  *
  * Web服务器功能：
  * - 访问 http://IP地址/ - 查看美观的网页界面（自动每3秒刷新）
  * - 访问 http://IP地址/temperature - 获取纯文本温度（如"25.3°C"）
+ * - 访问 http://IP地址/humidity - 获取纯文本湿度（如"65.2%"）
  * - 访问 http://IP地址/json - 获取JSON格式数据
  *
  * 使用示例：
@@ -597,8 +652,8 @@ void loop() {
  * - 其他程序调用API：curl http://192.168.1.100/json
  *
  * 关键概念：
- * - I2C通信：OLED使用I2C协议（两根线：SCL时钟线、SDA数据线）
- * - OneWire：DS18B20使用单总线协议（一根数据线）
+ * - I2C通信：OLED和DHT20使用I2C协议（两根线：SCL时钟线、SDA数据线）
+ * - DHT20：温湿度传感器，I2C接口，无需上拉电阻
  * - NTP：网络时间协议，从互联网服务器获取准确时间
  * - HTTP服务器：ESP32作为Web服务器，响应手机/电脑的HTTP请求
  * - HTML/CSS/JavaScript：构建美观的网页界面

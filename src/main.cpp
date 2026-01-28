@@ -61,12 +61,21 @@ const char* ntpServer = "cn.pool.ntp.org";           // NTP服务器地址，使
 const long gmtOffset_sec = 8 * 3600;              // 时区偏移（秒），8小时表示东八区（北京时间）
 const int daylightOffset_sec = 0;                 // 夏令时偏移（秒），中国不使用夏令时设为0
 
+// ==================== 传感器校准参数 ====================
+// DHT20传感器校准值（通过与其他温度计对比测得）
+const float tempOffset = -1.0;       // 温度校准偏移值：测量值偏高的度数（负值表示减去）
+const float humOffset = +3.0;        // 湿度校准偏移值：测量值偏低的百分比（正值表示加上）
+
 // ==================== 全局变量 ====================
 float currentTemperature = 0.0;          // 存储当前温度值（供Web服务器使用）
 float currentHumidity = 0.0;             // 存储当前湿度值（供Web服务器使用）
 char currentTime[32] = "";                // 存储当前时间字符串
 char currentDate[32] = "";               // 存储当前日期字符串
 bool firstDataReady = false;             // 标记是否已获取到第一组数据
+
+// ==================== 传感器刷新控制 ====================
+int sensorUpdateCounter = 0;             // 传感器更新计数器
+const int sensorUpdateInterval = 5;       // 传感器更新间隔（5次loop=5秒）
 
 // ==================== 系统保护变量 ====================
 unsigned long lastWiFiCheck = 0;         // 上次检查WiFi的时间
@@ -236,36 +245,28 @@ void handleRoot() {
   html += ".data-item { flex: 1; }\n";                   // 数据项样式
   html += ".data-value { font-size: 48px; font-weight: bold; margin: 10px 0; }\n";  // 数据值大字体
   html += ".data-label { font-size: 14px; color: #888; }\n";  // 数据标签样式
-  html += ".hum-color { color: #3498db; }\n";             // 湿度颜色
+
+  // 根据温度动态设置颜色（蓝色<20°C，橙色20-30°C，红色>30°C）
+  if(currentTemperature < 20) {
+    html += ".temp-color { color: #3498db; }\n";  // 蓝色（20度以下）
+  } else if(currentTemperature >= 20 && currentTemperature < 30) {
+    html += ".temp-color { color: #e67e22; }\n";  // 橙色（20-30度）
+  } else {
+    html += ".temp-color { color: #e74c3c; }\n";  // 红色（30度以上）
+  }
+  html += ".hum-color { color: #27ae60; }\n";  // 湿度颜色（绿色）
   html += ".time { font-size: 24px; color: #666; margin: 10px 0; }\n";         // 时间样式
   html += ".date { font-size: 18px; color: #888; margin-bottom: 20px; }\n";    // 日期样式
   html += ".icon { font-size: 60px; margin-bottom: 10px; }\n";                 // 图标样式
   html += ".refresh-info { font-size: 12px; color: #aaa; margin-top: 20px; }\n";  // 刷新提示
   html += ".unit { font-size: 24px; }\n";                                      // 单位样式
 
+
   html += "</style>\n";                                    // CSS样式结束
   html += "<script>\n";                                    // JavaScript开始
 
-  // 动态温度颜色（根据温度值）
-  html += "const temperature = " + String(currentTemperature, 1) + ";\n";
-  html += "let tempColor = '';\n";
-  html += "if (temperature < 20) {\n";
-  html += "  tempColor = '#3498db';\n";  // 蓝色（20度以下）
-  html += "} else if (temperature >= 20 && temperature < 30) {\n";
-  html += "  const ratio = (temperature - 20) / 10;\n";  // 黄色到橙色渐变
-  html += "  const r = Math.round(241 + ratio * (230 - 241));\n";
-  html += "  const g = Math.round(196 + ratio * (126 - 196));\n";
-  html += "  const b = Math.round(15 + ratio * (34 - 15));\n";
-  html += "  tempColor = 'rgb(' + r + ',' + g + ',' + b + ')';\n";
-  html += "} else {\n";
-  html += "  tempColor = '#e74c3c';\n";  // 红色（30度以上）
-  html += "}\n";
-  html += "document.addEventListener('DOMContentLoaded', function() {\n";
-  html += "  document.querySelectorAll('.temp-color').forEach(el => el.style.color = tempColor);\n";
-  html += "});\n";
-
-  // 自动刷新页面（每3秒刷新一次）
-  html += "setTimeout(function(){location.reload();}, 3000);\n";  // 3秒后自动刷新
+  // 自动刷新页面（每10秒刷新一次，降低ESP32负担）
+  html += "setTimeout(function(){location.reload();}, 10000);\n";  // 10秒后自动刷新
   html += "</script>\n";                                   // JavaScript结束
   html += "</head>\n<body>\n";                             // head结束，body开始
   html += "<div class=\"container\">\n";                   // 容器开始
@@ -524,36 +525,47 @@ void loop() {
     return;                                                // 跳过本次循环，等待下次重试
   }
 
-  // ==================== 读取温湿度 ====================
-  // AHT20需要先触发测量
-  sensors_event_t humidity, temp;
-  aht.getEvent(&humidity, &temp);  // 获取温度和湿度事件
+  // ==================== 读取温湿度（每5次循环读取一次=5秒） ====================
+  sensorUpdateCounter++;
+  if(sensorUpdateCounter >= sensorUpdateInterval) {
+    sensorUpdateCounter = 0;  // 重置计数器
 
-  float temperature = temp.temperature;    // 温度（摄氏度）
-  float hum = humidity.relative_humidity;  // 湿度（百分比）
+    // AHT20需要先触发测量
+    sensors_event_t humidity, temp;
+    aht.getEvent(&humidity, &temp);  // 获取温度和湿度事件
 
-  // 调试输出
-  Serial.print("Temperature: ");
-  Serial.print(temperature);
-  Serial.print("°C, Humidity: ");
-  Serial.print(hum);
-  Serial.println("%");
+    // 应用校准偏移值
+    float temperature = temp.temperature + tempOffset;    // 温度校准后值（摄氏度）
+    float hum = humidity.relative_humidity + humOffset;    // 湿度校准后值（百分比）
 
-  // 检查传感器是否正常工作
-  if(isnan(temperature) || isnan(hum)) {  // 如果读取失败
-    Serial.println("Error: AHT20 reading invalid!");
-    display.clearBuffer();                                 // 清空缓冲区（U8g2版本）
-    display.setFont(u8g2_font_ncenB08_tr);                // 设置字体
-    display.drawStr(0, 15, "Sensor Error!");               // 显示传感器错误
-    display.sendBuffer();                                 // 发送到OLED显示
-    delay(2000);                                           // 显示2秒
-    return;                                                // 跳过本次循环
+    // 调试输出（显示原始值和校准后值）
+    Serial.print("Raw Temp: ");
+    Serial.print(temp.temperature, 2);
+    Serial.print("°C → Calibrated: ");
+    Serial.print(temperature, 2);
+    Serial.print("°C, Raw Hum: ");
+    Serial.print(humidity.relative_humidity, 1);
+    Serial.print("% → Calibrated: ");
+    Serial.print(hum, 1);
+    Serial.println("%");
+
+    // 检查传感器是否正常工作
+    if(isnan(temperature) || isnan(hum)) {  // 如果读取失败
+      Serial.println("Error: AHT20 reading invalid!");
+      display.clearBuffer();                                 // 清空缓冲区（U8g2版本）
+      display.setFont(u8g2_font_ncenB08_tr);                // 设置字体
+      display.drawStr(0, 15, "Sensor Error!");               // 显示传感器错误
+      display.sendBuffer();                                 // 发送到OLED显示
+      delay(2000);                                           // 显示2秒
+      return;                                                // 跳过本次循环
+    }
+
+    // 更新全局变量（供Web服务器使用）
+    currentTemperature = temperature;                       // 保存当前温度值
+    currentHumidity = hum;                               // 保存当前湿度值
   }
 
-  // ==================== 更新全局变量 ====================
-  // 更新全局变量（供Web服务器使用）
-  currentTemperature = temperature;                       // 保存当前温度值
-  currentHumidity = hum;                               // 保存当前湿度值
+  // ==================== 更新时间和日期（每次循环都更新） ====================
   sprintf(currentTime, "%02d:%02d:%02d",                    // 格式化时间字符串
           timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
   sprintf(currentDate, "%04d-%02d-%02d",                    // 格式化日期字符串
@@ -584,8 +596,8 @@ void loop() {
   // ========== 显示温湿度（居中，较小字体，第三行） ==========
   char tempHumStr[30];                                     // 定义字符数组存储温湿度字符串
   sprintf(tempHumStr, "%.1f\xB0""C  %.1f%%",              // 格式化温湿度字符串，\xB0是度数符号的十六进制码
-          temperature,                                     // 温度值
-          hum);                                             // 湿度值
+          currentTemperature,                               // 温度值（使用全局变量）
+          currentHumidity);                                 // 湿度值（使用全局变量）
   printCentered(tempHumStr, 60, u8g2_font_ncenB12_tf);    // 在y=60位置居中显示温湿度，使用支持完整字符集的字体
 
   // 刷新显示屏（U8g2版本）
@@ -596,7 +608,7 @@ void loop() {
   Serial.print("Time: ");                                  // 打印"Time: "
   Serial.print(timeStr);                                   // 打印时间字符串，如"14:30:45"
   Serial.print("  Temp: ");                               // 打印"  Temp: "
-  Serial.print(temperature, 2);                           // 打印温度值，保留2位小数，如"25.37"
+  Serial.print(currentTemperature, 2);                       // 打印温度值，保留2位小数，如"25.37"
   Serial.print(" C  WiFi: ");                             // 打印WiFi状态
   Serial.println(WiFi.status() == WL_CONNECTED ? "OK" : "LOST");  // 打印WiFi连接状态
 
@@ -606,7 +618,7 @@ void loop() {
 
   // ==================== 等待1秒后继续循环 ====================
   delay(1000);                                             // 延迟1000毫秒（1秒）
-                                                            // 这样每秒更新一次显示
+                                                            // 时间每秒更新一次，温湿度每5秒更新一次，Web页面10秒刷新一次
 }
 
 /**

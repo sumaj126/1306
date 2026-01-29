@@ -190,7 +190,7 @@ void checkMemory() {
   unsigned long freeHeap = ESP.getFreeHeap();
   unsigned long minFreeHeap = ESP.getMinFreeHeap();
   
-  if(freeHeap < 30000) {  // 如果剩余内存小于30KB
+  if(freeHeap < 20000) {  // 如果剩余内存小于20KB（降低阈值）
     Serial.print("WARNING: Low memory! Free: ");
     Serial.print(freeHeap);
     Serial.print(" bytes, Min: ");
@@ -286,7 +286,7 @@ void handleRoot() {
   html += "<div class=\"data-label\">湿度</div>\n";        // 湿度标签
   html += "</div>\n";                                      // 湿度数据项结束
   html += "</div>\n";                                      // 数据行结束
-  html += "<div class=\"refresh-info\">页面每3秒自动刷新</div>\n";    // 刷新提示
+  html += "<div class=\"refresh-info\">页面每10秒自动刷新</div>\n";    // 刷新提示
 
   html += "</div>\n";                                      // 容器结束
   html += "</body>\n</html>\n";                            // body结束，HTML结束

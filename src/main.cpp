@@ -500,7 +500,7 @@ void setup() {
 
   display.clearBuffer();                                  // 清空OLED准备进入主循环显示
   display.setFont(u8g2_font_ncenB08_tr);                  // 设置字体
-  display.drawStr(0, 32, "Syncing Time...");             // 显示时间同步状态
+  display.drawStr(0, 32, "Starting...");                // 显示启动状态
   display.sendBuffer();                                   // 更新OLED
 
   Serial.println("System ready. Watchdog running.");
@@ -619,7 +619,7 @@ void loop() {
            timeinfo.tm_year + 1900,                         // 年份：2025
            timeinfo.tm_mon + 1,                             // 月份：1-12
            timeinfo.tm_mday);                               // 日期：1-31
-  printCentered(dateStr, 12, u8g2_font_ncenB08_tr);       // 在y=12位置居中显示日期，使用小字体
+  printCentered(dateStr, 10, u8g2_font_6x10_tr);         // 在y=10位置居中显示日期，使用更稳定的6x10字体
 
   // ========== 显示时间（居中，大字体，第二行） ==========
   char timeStr[16];                                        // 定义字符数组存储时间字符串

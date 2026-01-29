@@ -72,6 +72,8 @@ float currentHumidity = 0.0;             // 存储当前湿度值（供Web服务
 char currentTime[32] = "";                // 存储当前时间字符串
 char currentDate[32] = "";               // 存储当前日期字符串
 bool firstDataReady = false;             // 标记是否已获取到第一组数据
+struct tm lastValidTime;             // 存储最后一次有效时间（用于NTP失败时fallback）
+bool hasValidTime = false;           // 标记是否有有效时间
 
 // ==================== 传感器刷新控制 ====================
 int sensorUpdateCounter = 0;             // 传感器更新计数器
@@ -81,7 +83,7 @@ const int sensorUpdateInterval = 5;       // 传感器更新间隔（5次loop=5�
 unsigned long lastWiFiCheck = 0;         // 上次检查WiFi的时间
 unsigned long lastNTPCheck = 0;          // 上次检查NTP的时间
 const unsigned long wifiCheckInterval = 30000;  // WiFi检查间隔（30秒）
-const unsigned long ntpCheckInterval = 600000;  // NTP检查间隔（10分钟）
+const unsigned long ntpCheckInterval = 86400000;  // NTP检查间隔（24小时=一天）
 int reconnectCount = 0;                  // WiFi重连次数
 const int maxReconnectCount = 5;         // 最大重连次数后重启
 
@@ -160,23 +162,30 @@ void checkWiFiConnection() {
 // ==================== NTP时间同步函数 ====================
 /**
  * 检查并同步NTP时间
- * 每10分钟同步一次时间,防止时间漂移
+ * 每24小时同步一次时间（掉电后重启才需要校准）
  */
 void checkNTPSync() {
   unsigned long currentMillis = millis();
-  
-  // 每隔10分钟检查一次NTP同步
+
+  // 每隔24小时检查一次NTP同步
   if(currentMillis - lastNTPCheck >= ntpCheckInterval) {
     lastNTPCheck = currentMillis;
-    
-    // 重新配置时间同步
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    
+
+    // 重新配置时间同步（清除NTP缓存，强制重新获取）
+    configTime(0, 0, "pool.ntp.org");  // 临时重置
+    delay(100);
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);  // 重新设置
+
     struct tm timeinfo;
     if(getLocalTime(&timeinfo)) {
       Serial.println("NTP time sync successful");
+      Serial.print("NTP synced: ");
+      Serial.println(&timeinfo, "%Y-%m-%d %H:%M:%S");
+      // 同步成功后更新有效时间
+      memcpy(&lastValidTime, &timeinfo, sizeof(struct tm));
+      hasValidTime = true;
     } else {
-      Serial.println("NTP time sync failed");
+      Serial.println("NTP time sync failed, using cached time");
     }
   }
 }
@@ -461,6 +470,9 @@ void setup() {
     Serial.println("\nNTP time sync successful!");
     Serial.print("Current time: ");
     Serial.println(&timeinfo, "%Y-%m-%d %H:%M:%S");
+    // 保存初始有效时间
+    memcpy(&lastValidTime, &timeinfo, sizeof(struct tm));
+    hasValidTime = true;
   } else {
     Serial.println("\nNTP time sync failed, will retry in loop");
   }
@@ -516,13 +528,37 @@ void loop() {
   // getLocalTime()会从NTP服务器获取时间并填充到timeinfo结构体
   if(!getLocalTime(&timeinfo)) {                          // 如果获取时间失败
     Serial.println("Failed to obtain time");              // 输出错误信息
-    // 显示同步状态
-    display.clearBuffer();
-    display.setFont(u8g2_font_ncenB08_tr);
-    display.drawStr(0, 32, "Syncing Time...");
-    display.sendBuffer();
-    delay(500);                                            // 等待0.5秒后重试
-    return;                                                // 跳过本次循环，等待下次重试
+
+    // 如果有上次有效时间，使用它（继续显示，不停止）
+    if(hasValidTime) {
+      memcpy(&timeinfo, &lastValidTime, sizeof(struct tm));
+      // 手动增加1秒，保持时间继续走动
+      timeinfo.tm_sec++;
+      if(timeinfo.tm_sec >= 60) {
+        timeinfo.tm_sec = 0;
+        timeinfo.tm_min++;
+        if(timeinfo.tm_min >= 60) {
+          timeinfo.tm_min = 0;
+          timeinfo.tm_hour++;
+          if(timeinfo.tm_hour >= 24) {
+            timeinfo.tm_hour = 0;
+          }
+        }
+      }
+      Serial.println("Using fallback time");
+    } else {
+      // 显示同步状态
+      display.clearBuffer();
+      display.setFont(u8g2_font_ncenB08_tr);
+      display.drawStr(0, 32, "Syncing Time...");
+      display.sendBuffer();
+      delay(500);                                            // 等待0.5秒后重试
+      return;                                                // 跳过本次循环，等待下次重试
+    }
+  } else {
+    // 时间获取成功，保存为有效时间
+    memcpy(&lastValidTime, &timeinfo, sizeof(struct tm));
+    hasValidTime = true;
   }
 
   // ==================== 读取温湿度（每5次循环读取一次=5秒） ====================

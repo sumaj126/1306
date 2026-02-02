@@ -1,15 +1,17 @@
 /**
- * ESP32 + DHT20 + OLED 0.96寸(SSD1306) 温湿度时间显示项目 + Web服务器
+ * ESP32 + DHT20 + OLED 0.96寸(SSD1306) + HC-SR501 人体感应 温湿度时间显示项目 + Web服务器
  * 使用U8g2字体库，支持更多字体和语言
  * 功能：
  * 1. 从NTP服务器获取网络时间
  * 2. 从DHT20读取温度和湿度
- * 3. 在OLED屏幕上居中显示时间、温度和湿度（使用U8g2精美字体）
- * 4. 启动Web服务器，手机可通过浏览器访问ESP32查看温度、湿度和时间
+ * 3. HC-SR501人体感应：人来亮屏，人走1分钟后熄屏
+ * 4. 在OLED屏幕上居中显示时间、温度和湿度（使用U8g2精美字体）
+ * 5. 启动Web服务器，手机可通过浏览器访问ESP32查看温度、湿度和时间
  *
  * 硬件连接：
  * - OLED (I2C): VCC->3.3V, GND->GND, SCL->GPIO22, SDA->GPIO21
  * - DHT20 (I2C): VCC->3.3V, GND->GND, SCL->GPIO22, SDA->GPIO21 (与OLED共用I2C总线)
+ * - HC-SR501 PIR传感器: VCC->5V, GND->GND, OUT->GPIO13
  *
  * 使用方法：
  * 1. 连接WiFi后，OLED会显示ESP32的IP地址
@@ -17,6 +19,7 @@
  * 3. 访问 http://IP地址/temperature 可获取纯文本温度数据
  * 4. 访问 http://IP地址/humidity 可获取纯文本湿度数据
  * 5. 访问 http://IP地址/json 可获取JSON格式数据
+ * 6. 人体靠近时OLED自动亮屏，离开1分钟后自动熄屏
  */
 
 // ==================== 头文件包含 ====================
@@ -74,6 +77,13 @@ char currentDate[32] = "";               // 存储当前日期字符串
 bool firstDataReady = false;             // 标记是否已获取到第一组数据
 struct tm lastValidTime;             // 存储最后一次有效时间（用于NTP失败时fallback）
 bool hasValidTime = false;           // 标记是否有有效时间
+
+// ==================== HC-SR501人体红外感应配置 ====================
+#define PIR_SENSOR_PIN 13              // PIR传感器连接的GPIO引脚
+unsigned long lastMotionTime = 0;      // 上次检测到人体活动的时间
+const unsigned long screenOffDelay = 60000;  // 熄屏延迟时间（60秒=1分钟）
+bool screenOn = true;                 // 屏幕状态：true=亮屏，false=熄屏
+bool lastPirState = false;            // 上次PIR传感器状态
 
 // ==================== 传感器刷新控制 ====================
 int sensorUpdateCounter = 0;             // 传感器更新计数器
@@ -371,6 +381,54 @@ void handleNotFound() {
   server.send(404, "text/plain", message);                 // 发送404错误响应
 }
 
+// ==================== PIR传感器控制函数 ====================
+/**
+ * 读取PIR传感器状态并控制OLED屏幕开关
+ * 人来亮屏，人走1分钟后熄屏
+ */
+void checkPIRSensor() {
+  static unsigned long lastPIRCheck = 0;  // 上次检查PIR的时间
+  unsigned long currentMillis = millis();
+
+  // 每秒检查一次PIR（避免过于频繁）
+  if(currentMillis - lastPIRCheck >= 1000) {
+    lastPIRCheck = currentMillis;
+
+    // 读取PIR传感器状态（HIGH=有人，LOW=无人）
+    int pirState = digitalRead(PIR_SENSOR_PIN);
+    bool currentPirState = (pirState == HIGH);
+
+    // 检测到人体活动
+    if(currentPirState) {
+      lastMotionTime = currentMillis;  // 更新最后活动时间
+      if(!screenOn) {
+        // 屏幕当前是熄灭状态，需要点亮
+        screenOn = true;
+        Serial.println("=== PIR: Motion detected! Screen ON ===");
+      }
+    }
+
+    // 检查是否需要熄屏（人离开超过1分钟）
+    if(screenOn && (currentMillis - lastMotionTime >= screenOffDelay)) {
+      screenOn = false;
+      Serial.println("=== PIR: No motion for 1 minute. Screen OFF ===");
+    }
+
+    // 记录当前PIR状态用于下次比较
+    lastPirState = currentPirState;
+
+    // 每分钟输出一次PIR状态（调试用）
+    static unsigned long lastPirDebug = 0;
+    if(currentMillis - lastPirDebug >= 60000) {
+      lastPirDebug = currentMillis;
+      Serial.print("PIR Status: ");
+      Serial.print(currentPirState ? "HIGH (Motion)" : "LOW (No motion)");
+      Serial.print(", Screen: ");
+      Serial.println(screenOn ? "ON" : "OFF");
+    }
+  }
+}
+
 /**
  * setup() - 初始化函数
  * 程序启动时执行一次，用于初始化所有硬件和设置
@@ -379,6 +437,19 @@ void setup() {
   // 初始化串口通信
   Serial.begin(115200);                                    // 设置串口波特率为115200
                                                             // 用于向电脑输出调试信息
+
+  // 初始化PIR传感器
+  pinMode(PIR_SENSOR_PIN, INPUT);                          // 设置PIR引脚为输入
+  Serial.println("PIR sensor initialized on GPIO" + String(PIR_SENSOR_PIN));
+
+  // 测试读取PIR传感器初始状态
+  int initialPirState = digitalRead(PIR_SENSOR_PIN);
+  Serial.print("PIR initial state: ");
+  Serial.println(initialPirState == HIGH ? "HIGH" : "LOW");
+
+  // 初始化lastMotionTime
+  lastMotionTime = millis();
+  Serial.println("PIR lastMotionTime initialized to " + String(lastMotionTime));
 
   // 初始化OLED显示屏（U8g2版本）
   display.begin();                                          // 初始化U8g2显示屏
@@ -504,6 +575,7 @@ void setup() {
   display.sendBuffer();                                   // 更新OLED
 
   Serial.println("System ready. Watchdog running.");
+  Serial.println("=== Entering main loop ===");
 }
 
 /**
@@ -514,11 +586,12 @@ void loop() {
   // ==================== 喂看门狗 ====================
   esp_task_wdt_reset();                                    // 重置看门狗计时器,防止系统重启
                                                             // 必须在30秒内调用一次
-  
+
   // ==================== 系统保护检查 ====================
   checkWiFiConnection();                                   // 检查并恢复WiFi连接
   checkNTPSync();                                         // 定期同步NTP时间
   checkMemory();                                           // 监控剩余内存
+  checkPIRSensor();                                        // 检查PIR传感器状态
 
   // ==================== 获取时间 ====================
   struct tm timeinfo;                                      // 定义时间结构体变量
@@ -608,37 +681,59 @@ void loop() {
           timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
   firstDataReady = true;                                    // 标记数据已准备就绪
 
-  // ==================== OLED显示 ====================
-  // 清空显示屏缓冲区（U8g2版本）
-  display.clearBuffer();                                  // 清空所有待显示的内容
-                                                            // 注意：此时OLED屏幕还没变，需要调用sendBuffer()才更新
-
-  // ========== 显示日期（居中） ==========
+  // 准备显示字符串（用于OLED和串口）
   char dateStr[20];                                        // 定义字符数组存储日期字符串
   sprintf(dateStr, "%04d-%02d-%02d",                       // 格式化日期字符串
            timeinfo.tm_year + 1900,                         // 年份：2025
            timeinfo.tm_mon + 1,                             // 月份：1-12
            timeinfo.tm_mday);                               // 日期：1-31
-  printCentered(dateStr, 10, u8g2_font_6x10_tr);         // 在y=10位置居中显示日期，使用更稳定的6x10字体
 
-  // ========== 显示时间（居中，大字体，第二行） ==========
   char timeStr[16];                                        // 定义字符数组存储时间字符串
   sprintf(timeStr, "%02d:%02d:%02d",                       // 格式化时间为HH:MM:SS
            timeinfo.tm_hour,                                // 小时：0-23
            timeinfo.tm_min,                                 // 分钟：0-59
            timeinfo.tm_sec);                                // 秒：0-59
-  printCentered(timeStr, 38, u8g2_font_ncenB18_tr);       // 在y=38位置居中显示，使用大字体（屏幕正中央）
 
-  // ========== 显示温湿度（居中，较小字体，第三行） ==========
   char tempHumStr[30];                                     // 定义字符数组存储温湿度字符串
   sprintf(tempHumStr, "%.1f\xB0""C  %.1f%%",              // 格式化温湿度字符串，\xB0是度数符号的十六进制码
           currentTemperature,                               // 温度值（使用全局变量）
           currentHumidity);                                 // 湿度值（使用全局变量）
-  printCentered(tempHumStr, 60, u8g2_font_ncenB12_tf);    // 在y=60位置居中显示温湿度，使用支持完整字符集的字体
 
-  // 刷新显示屏（U8g2版本）
-  display.sendBuffer();                                   // 将缓冲区的所有内容发送到OLED屏幕显示
-                                                            // 此时用户才能看到屏幕上的内容
+  // ==================== OLED显示 ====================
+  // 只有屏幕开启时才显示内容
+  if(screenOn) {
+    // 清空显示屏缓冲区（U8g2版本）
+    display.clearBuffer();                                  // 清空所有待显示的内容
+                                                                // 注意：此时OLED屏幕还没变，需要调用sendBuffer()才更新
+
+    // ========== 左上角显示人体感应图标 ==========
+    display.setFont(u8g2_font_open_iconic_all_1x_t);  // 使用小图标字体（1x）
+    int pirState = digitalRead(PIR_SENSOR_PIN);
+    if(pirState == HIGH) {
+      // 有人：显示人形图标
+      display.drawGlyph(0, 8, 0x40);  // 0x40是人形图标，小尺寸
+    } else {
+      // 无人：显示空心圆圈或叉号
+      display.drawGlyph(0, 8, 0x45);  // 0x45是圆圈图标，小尺寸
+    }
+
+    // ========== 显示日期（居中） ==========
+    printCentered(dateStr, 10, u8g2_font_6x10_tr);         // 在y=10位置居中显示日期，使用更稳定的6x10字体
+
+    // ========== 显示时间（居中，大字体，第二行） ==========
+    printCentered(timeStr, 38, u8g2_font_ncenB18_tr);       // 在y=38位置居中显示，使用大字体（屏幕正中央）
+
+    // ========== 显示温湿度（居中，较小字体，第三行） ==========
+    printCentered(tempHumStr, 60, u8g2_font_ncenB12_tf);    // 在y=60位置居中显示温湿度，使用支持完整字符集的字体
+
+    // 刷新显示屏（U8g2版本）
+    display.sendBuffer();                                   // 将缓冲区的所有内容发送到OLED屏幕显示
+                                                                // 此时用户才能看到屏幕上的内容
+  } else {
+    // 屏幕关闭状态：清空OLED或熄屏
+    display.clearBuffer();
+    display.sendBuffer();  // 发送空白缓冲区，清空屏幕
+  }
 
   // ==================== 串口输出（调试用） ====================
   Serial.print("Time: ");                                  // 打印"Time: "
@@ -646,7 +741,9 @@ void loop() {
   Serial.print("  Temp: ");                               // 打印"  Temp: "
   Serial.print(currentTemperature, 2);                       // 打印温度值，保留2位小数，如"25.37"
   Serial.print(" C  WiFi: ");                             // 打印WiFi状态
-  Serial.println(WiFi.status() == WL_CONNECTED ? "OK" : "LOST");  // 打印WiFi连接状态
+  Serial.print(WiFi.status() == WL_CONNECTED ? "OK" : "LOST");  // 打印WiFi连接状态
+  Serial.print("  PIR: ");                               // 打印PIR传感器状态
+  Serial.println(digitalRead(PIR_SENSOR_PIN) == HIGH ? "HIGH" : "LOW");  // 实时读取PIR状态
 
   // ==================== 处理Web请求 ====================
   server.handleClient();                                   // 处理来自客户端的HTTP请求

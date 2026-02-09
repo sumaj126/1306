@@ -126,12 +126,14 @@ void checkWiFiConnection() {
       WiFi.disconnect();
       WiFi.begin(ssid, password);
       
-      // 等待连接（最多10秒）
+      // 等待连接（最多10秒），期间要喂狗
       int retryTimeout = 10;
       while(WiFi.status() != WL_CONNECTED && retryTimeout > 0) {
-        delay(1000);
+        esp_task_wdt_reset();  // 喂狗
+        server.handleClient();  // 处理HTTP请求
+        delay(100);
         retryTimeout--;
-        Serial.print(".");
+        if(retryTimeout % 10 == 0) Serial.print(".");
       }
       
       if(WiFi.status() == WL_CONNECTED) {
@@ -208,22 +210,23 @@ void checkNTPSync() {
 void checkMemory() {
   unsigned long freeHeap = ESP.getFreeHeap();
   unsigned long minFreeHeap = ESP.getMinFreeHeap();
-  
+
   if(freeHeap < 20000) {  // 如果剩余内存小于20KB（降低阈值）
     Serial.print("WARNING: Low memory! Free: ");
     Serial.print(freeHeap);
     Serial.print(" bytes, Min: ");
     Serial.print(minFreeHeap);
     Serial.println(" bytes");
-    
-    // OLED显示内存警告
+
+    // OLED显示内存警告（不阻塞）
     display.clearBuffer();
     display.setFont(u8g2_font_ncenB08_tr);
     display.drawStr(0, 15, "Low Memory!");
-    String memStr = "Free: " + String(freeHeap / 1024) + "KB";
-    display.drawStr(0, 30, memStr.c_str());
+    char memStr[32];
+    snprintf(memStr, sizeof(memStr), "Free: %dKB", freeHeap / 1024);
+    display.drawStr(0, 30, memStr);
     display.sendBuffer();
-    delay(2000);
+    // 移除delay，避免阻塞
   }
 }
 
@@ -246,72 +249,56 @@ void handleRoot() {
   server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  String html = "<!DOCTYPE html>\n";                       // HTML5文档声明
-  html += "<html>\n<head>\n";                              // HTML开始标签
-  html += "<meta charset=\"UTF-8\">\n";                     // 设置字符编码为UTF-8
-  html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n";  // 适配移动端
-  html += "<title>ESP32 温湿度监控</title>\n";             // 网页标题
-  html += "<style>\n";                                     // CSS样式开始
+  // 使用String一次性构建，减少内存碎片
+  String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\">";
+  html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">";
+  html += "<title>ESP32 温湿度监控</title><style>";
+  html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; ";
+  html += "background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); ";
+  html += "min-height: 100vh; display: flex; justify-content: center; align-items: center; }";
+  html += ".container { background: white; padding: 30px; border-radius: 20px; ";
+  html += "box-shadow: 0 10px 40px rgba(0,0,0,0.2); max-width: 400px; width: 100%; text-align: center; }";
+  html += "h1 { color: #333; margin-bottom: 10px; font-size: 28px; }";
+  html += ".data-row { display: flex; justify-content: space-around; margin: 20px 0; }";
+  html += ".data-item { flex: 1; }";
+  html += ".data-value { font-size: 48px; font-weight: bold; margin: 10px 0; }";
+  html += ".data-label { font-size: 14px; color: #888; }";
 
-  // 美观的CSS样式
-  html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; ";  // 页面字体和内边距
-  html += "background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); ";      // 渐变背景
-  html += "min-height: 100vh; display: flex; justify-content: center; align-items: center; }\n";  // 居中布局
-  html += ".container { background: white; padding: 30px; border-radius: 20px; ";  // 容器样式
-  html += "box-shadow: 0 10px 40px rgba(0,0,0,0.2); max-width: 400px; width: 100%; text-align: center; }\n";  // 阴影和圆角
-  html += "h1 { color: #333; margin-bottom: 10px; font-size: 28px; }\n";      // 标题样式
-  html += ".data-row { display: flex; justify-content: space-around; margin: 20px 0; }\n";  // 数据行样式
-  html += ".data-item { flex: 1; }\n";                   // 数据项样式
-  html += ".data-value { font-size: 48px; font-weight: bold; margin: 10px 0; }\n";  // 数据值大字体
-  html += ".data-label { font-size: 14px; color: #888; }\n";  // 数据标签样式
-
-  // 根据温度动态设置颜色（蓝色<20°C，橙色20-30°C，红色>30°C）
+  // 根据温度动态设置颜色
   if(currentTemperature < 20) {
-    html += ".temp-color { color: #3498db; }\n";  // 蓝色（20度以下）
+    html += ".temp-color { color: #3498db; }";
   } else if(currentTemperature >= 20 && currentTemperature < 30) {
-    html += ".temp-color { color: #e67e22; }\n";  // 橙色（20-30度）
+    html += ".temp-color { color: #e67e22; }";
   } else {
-    html += ".temp-color { color: #e74c3c; }\n";  // 红色（30度以上）
+    html += ".temp-color { color: #e74c3c; }";
   }
-  html += ".hum-color { color: #27ae60; }\n";  // 湿度颜色（绿色）
-  html += ".time { font-size: 24px; color: #666; margin: 10px 0; }\n";         // 时间样式
-  html += ".date { font-size: 18px; color: #888; margin-bottom: 20px; }\n";    // 日期样式
-  html += ".icon { font-size: 60px; margin-bottom: 10px; }\n";                 // 图标样式
-  html += ".refresh-info { font-size: 12px; color: #aaa; margin-top: 20px; }\n";  // 刷新提示
-  html += ".unit { font-size: 24px; }\n";                                      // 单位样式
+  html += ".hum-color { color: #27ae60; }";
+  html += ".time { font-size: 24px; color: #666; margin: 10px 0; }";
+  html += ".date { font-size: 18px; color: #888; margin-bottom: 20px; }";
+  html += ".icon { font-size: 60px; margin-bottom: 10px; }";
+  html += ".refresh-info { font-size: 12px; color: #aaa; margin-top: 20px; }";
+  html += ".unit { font-size: 24px; }";
+  html += "</style><script>";
+  html += "setTimeout(function(){location.reload();}, 10000);";
+  html += "</script></head><body><div class=\"container\">";
+  html += "<div class=\"icon\">🌡️</div>";
+  html += "<h1>实时温湿度监控</h1>";
+  html += "<div class=\"date\">" + String(currentDate) + "</div>";
+  html += "<div class=\"time\">" + String(currentTime) + "</div>";
+  html += "<div class=\"data-row\">";
+  html += "<div class=\"data-item\">";
+  html += "<div class=\"data-value temp-color\">" + String(currentTemperature, 1) + "<span class=\"unit\">°C</span></div>";
+  html += "<div class=\"data-label\">温度</div>";
+  html += "</div>";
+  html += "<div class=\"data-item\">";
+  html += "<div class=\"data-value hum-color\">" + String(currentHumidity, 1) + "<span class=\"unit\">%</span></div>";
+  html += "<div class=\"data-label\">湿度</div>";
+  html += "</div>";
+  html += "</div>";
+  html += "<div class=\"refresh-info\">页面每10秒自动刷新</div>";
+  html += "</div></body></html>";
 
-
-  html += "</style>\n";                                    // CSS样式结束
-  html += "<script>\n";                                    // JavaScript开始
-
-  // 自动刷新页面（每10秒刷新一次，降低ESP32负担）
-  html += "setTimeout(function(){location.reload();}, 10000);\n";  // 10秒后自动刷新
-  html += "</script>\n";                                   // JavaScript结束
-  html += "</head>\n<body>\n";                             // head结束，body开始
-  html += "<div class=\"container\">\n";                   // 容器开始
-
-  // 网页内容
-  html += "<div class=\"icon\">🌡️</div>\n";                // 图标
-  html += "<h1>实时温湿度监控</h1>\n";                    // 主标题
-  html += "<div class=\"date\">" + String(currentDate) + "</div>\n";  // 显示日期
-  html += "<div class=\"time\">" + String(currentTime) + "</div>\n";  // 显示时间
-  html += "<div class=\"data-row\">\n";                    // 数据行开始
-  html += "<div class=\"data-item\">\n";                  // 温度数据项
-  html += "<div class=\"data-value temp-color\">" + String(currentTemperature, 1) + "<span class=\"unit\">°C</span></div>\n";
-  html += "<div class=\"data-label\">温度</div>\n";        // 温度标签
-  html += "</div>\n";                                      // 温度数据项结束
-  html += "<div class=\"data-item\">\n";                  // 湿度数据项
-  html += "<div class=\"data-value hum-color\">" + String(currentHumidity, 1) + "<span class=\"unit\">%</span></div>\n";
-  html += "<div class=\"data-label\">湿度</div>\n";        // 湿度标签
-  html += "</div>\n";                                      // 湿度数据项结束
-  html += "</div>\n";                                      // 数据行结束
-  html += "<div class=\"refresh-info\">页面每10秒自动刷新</div>\n";    // 刷新提示
-
-  html += "</div>\n";                                      // 容器结束
-  html += "</body>\n</html>\n";                            // body结束，HTML结束
-
-  server.send(200, "text/html", html);                    // 发送HTML响应给客户端
-                                                            // 200表示成功，text/html表示HTML格式
+  server.send(200, "text/html", html);
 }
 
 /**
@@ -484,7 +471,8 @@ void setup() {
   // ==================== 启动看门狗 ====================
   // 启用任务看门狗,超时时间30秒
   esp_task_wdt_init(30, true);                             // 30秒超时,panic模式(系统重启)
-  Serial.println("Watchdog enabled (30s timeout)");
+  esp_task_wdt_add(NULL);                                  // 注册当前任务到看门狗(必须!)
+  Serial.println("Watchdog enabled and task registered (30s timeout)");
 
   // 连接WiFi网络
   WiFi.begin(ssid, password);                             // 开始连接WiFi
@@ -496,9 +484,9 @@ void setup() {
   display.sendBuffer();                                    // 发送到OLED显示
 
   while(WiFi.status() != WL_CONNECTED) {                   // 循环等待WiFi连接成功
-    delay(500);                                            // 延迟500毫秒
-    Serial.print(".");                                     // 打印一个点表示等待中
     esp_task_wdt_reset();                                  // 喂狗,防止看门狗超时
+    delay(100);                                            // 缩短延迟为100ms
+    if(millis() % 500 < 100) Serial.print(".");            // 每500ms打印一个点
   }
   Serial.println();                                        // 换行
   Serial.println("WiFi connected");                        // 输出连接成功信息
@@ -531,9 +519,9 @@ void setup() {
   const int maxSyncAttempts = 10;  // 最多尝试10次，每次延迟500ms，总共5秒
 
   while(!getLocalTime(&timeinfo) && syncAttempts < maxSyncAttempts) {
-    Serial.print(".");
-    delay(500);
     esp_task_wdt_reset();  // 喂狗
+    delay(100);
+    if(syncAttempts % 5 == 0) Serial.print(".");  // 每500ms打印一个点
     syncAttempts++;
   }
 
@@ -746,12 +734,12 @@ void loop() {
   Serial.println(digitalRead(PIR_SENSOR_PIN) == HIGH ? "HIGH" : "LOW");  // 实时读取PIR状态
 
   // ==================== 处理Web请求 ====================
-  server.handleClient();                                   // 处理来自客户端的HTTP请求
-                                                            // 这个函数需要频繁调用，以确保及时响应客户端
-
-  // ==================== 等待1秒后继续循环 ====================
-  delay(1000);                                             // 延迟1000毫秒（1秒）
-                                                            // 时间每秒更新一次，温湿度每5秒更新一次，Web页面10秒刷新一次
+  // 在delay期间也要持续处理HTTP请求，避免请求堆积
+  unsigned long delayStart = millis();
+  while(millis() - delayStart < 1000) {
+    server.handleClient();  // 持续处理HTTP请求
+    delay(10);  // 短暂延迟，避免CPU占用过高
+  }
 }
 
 /**

@@ -30,6 +30,7 @@
 #include <WebServer.h>                 // ESP32 Web服务器库,用于创建HTTP服务器
 #include <time.h>                      // C标准时间库,用于时间处理
 #include <esp_task_wdt.h>              // ESP32看门狗库
+#include <esp_system.h>                // ESP32系统信息库
 
 // ==================== OLED显示屏配置 ====================
 // 使用SSD1306驱动，I2C协议，完整帧缓冲模式
@@ -143,9 +144,20 @@ void checkWiFiConnection() {
         Serial.println(WiFi.localIP());
         reconnectCount = 0;  // 重置重连计数
         
-        // 重新配置静态IP
-        if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
-          Serial.println("Static IP configuration failed after reconnect");
+        // 重新配置静态IP，添加超时保护
+        esp_task_wdt_reset();
+        unsigned long configTimeout = millis();
+        bool configSuccess = false;
+        while(millis() - configTimeout < 3000 && !configSuccess) {
+          esp_task_wdt_reset();  // 持续喂狗
+          configSuccess = WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS);
+          if(!configSuccess) delay(100);
+        }
+        
+        if(!configSuccess) {
+          Serial.println("Static IP configuration timeout, using current IP");
+        } else {
+          Serial.println("Static IP reconfigured successfully");
         }
       } else {
         // 重连失败
@@ -160,7 +172,13 @@ void checkWiFiConnection() {
           display.drawStr(0, 15, "WiFi Failed!");
           display.drawStr(0, 30, "Restarting...");
           display.sendBuffer();
-          delay(2000);
+          
+          // 重启前持续喂狗
+          unsigned long restartDelayStart = millis();
+          while(millis() - restartDelayStart < 2000) {
+            esp_task_wdt_reset();
+            delay(100);
+          }
           ESP.restart();  // 重启ESP32
         }
       }
@@ -250,52 +268,69 @@ void handleRoot() {
   server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
 
   // 使用String一次性构建，减少内存碎片
+  // 样式与服务器端监控页面保持一致
   String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\">";
   html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">";
-  html += "<title>ESP32 温湿度监控</title><style>";
-  html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; ";
-  html += "background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); ";
-  html += "min-height: 100vh; display: flex; justify-content: center; align-items: center; }";
-  html += ".container { background: white; padding: 30px; border-radius: 20px; ";
-  html += "box-shadow: 0 10px 40px rgba(0,0,0,0.2); max-width: 400px; width: 100%; text-align: center; }";
-  html += "h1 { color: #333; margin-bottom: 10px; font-size: 28px; }";
-  html += ".data-row { display: flex; justify-content: space-around; margin: 20px 0; }";
-  html += ".data-item { flex: 1; }";
-  html += ".data-value { font-size: 48px; font-weight: bold; margin: 10px 0; }";
-  html += ".data-label { font-size: 14px; color: #888; }";
-
-  // 根据温度动态设置颜色
-  if(currentTemperature < 20) {
-    html += ".temp-color { color: #3498db; }";
-  } else if(currentTemperature >= 20 && currentTemperature < 30) {
-    html += ".temp-color { color: #e67e22; }";
-  } else {
-    html += ".temp-color { color: #e74c3c; }";
-  }
-  html += ".hum-color { color: #27ae60; }";
-  html += ".time { font-size: 24px; color: #666; margin: 10px 0; }";
-  html += ".date { font-size: 18px; color: #888; margin-bottom: 20px; }";
-  html += ".icon { font-size: 60px; margin-bottom: 10px; }";
-  html += ".refresh-info { font-size: 12px; color: #aaa; margin-top: 20px; }";
-  html += ".unit { font-size: 24px; }";
+  html += "<title>客厅温湿度监控</title><style>";
+  html += "* { margin: 0; padding: 0; box-sizing: border-box; }";
+  html += "body { font-family: 'Microsoft YaHei', Arial, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }";
+  html += ".container { background: white; border-radius: 20px; padding: 40px; box-shadow: 0 10px 40px rgba(0,0,0,0.1); max-width: 500px; width: 100%; }";
+  html += ".header { text-align: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 2px solid #f0f0f0; }";
+  html += ".title { font-size: 28px; color: #333; margin-bottom: 10px; font-weight: bold; }";
+  html += ".subtitle { font-size: 14px; color: #999; }";
+  html += ".time-display { text-align: center; font-size: 48px; font-weight: bold; color: #667eea; margin-bottom: 30px; font-family: 'Courier New', monospace; }";
+  html += ".data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }";
+  html += ".data-card { border-radius: 15px; padding: 25px; text-align: center; color: #333; }";
+  html += ".data-label { font-size: 16px; opacity: 0.9; margin-bottom: 10px; }";
+  html += ".data-value { font-size: 42px; font-weight: bold; }";
+  html += ".status-bar { background: #f8f9fa; border-radius: 10px; padding: 15px; text-align: center; font-size: 14px; color: #666; }";
+  html += ".icon { font-size: 32px; margin-bottom: 10px; }";
+  html += "@media (max-width: 480px) { .container { padding: 20px; } .title { font-size: 24px; } .time-display { font-size: 36px; } .data-card { padding: 15px; text-align: center; } .data-value { font-size: 32px; text-align: center; } }";
   html += "</style><script>";
-  html += "setTimeout(function(){location.reload();}, 10000);";
+
+  // JavaScript：动态更新时间和刷新页面
+  html += "function updateTime() {";
+  html += "  const now = new Date();";
+  html += "  const hours = String(now.getHours()).padStart(2, '0');";
+  html += "  const minutes = String(now.getMinutes()).padStart(2, '0');";
+  html += "  const seconds = String(now.getSeconds()).padStart(2, '0');";
+  html += "  document.getElementById('time').textContent = hours + ':' + minutes + ':' + seconds;";
+  html += "}";
+
+  // 根据温度设置颜色
+  html += "const temperature = " + String(currentTemperature, 1) + ";";
+  html += "let tempColor = temperature < 20 ? '#3498db' : (temperature >= 20 && temperature < 30 ? 'rgb(241,196,15)' : '#e74c3c');";
+  html += "const humColor = '#28a745';";
+  html += "document.addEventListener('DOMContentLoaded', function() {";
+  html += "  document.getElementById('temp-value').style.color = tempColor;";
+  html += "  document.getElementById('hum-value').style.color = humColor;";
+  html += "});";
+  html += "setInterval(updateTime, 1000);";
+  html += "setInterval(() => location.reload(), 10000);";
+  html += "window.onload = updateTime;";
+
   html += "</script></head><body><div class=\"container\">";
-  html += "<div class=\"icon\">🌡️</div>";
-  html += "<h1>实时温湿度监控</h1>";
-  html += "<div class=\"date\">" + String(currentDate) + "</div>";
-  html += "<div class=\"time\">" + String(currentTime) + "</div>";
-  html += "<div class=\"data-row\">";
-  html += "<div class=\"data-item\">";
-  html += "<div class=\"data-value temp-color\">" + String(currentTemperature, 1) + "<span class=\"unit\">°C</span></div>";
-  html += "<div class=\"data-label\">温度</div>";
+  html += "<div class=\"header\">";
+  html += "<div class=\"icon\">🏠</div>";
+  html += "<div class=\"title\">客厅温湿度监控</div>";
+  html += "<div class=\"subtitle\">Living Room Monitor</div>";
   html += "</div>";
-  html += "<div class=\"data-item\">";
-  html += "<div class=\"data-value hum-color\">" + String(currentHumidity, 1) + "<span class=\"unit\">%</span></div>";
-  html += "<div class=\"data-label\">湿度</div>";
+  html += "<div class=\"time-display\" id=\"time\">" + String(currentTime) + "</div>";
+  html += "<div class=\"data-grid\">";
+  html += "<div class=\"data-card\">";
+  html += "<div class=\"data-label\">🌡️ 温度</div>";
+  html += "<div class=\"data-value\" id=\"temp-value\">" + String(currentTemperature, 1) + "°C</div>";
+  html += "</div>";
+  html += "<div class=\"data-card\">";
+  html += "<div class=\"data-label\">💧 湿度</div>";
+  html += "<div class=\"data-value\" id=\"hum-value\">" + String(currentHumidity, 1) + "%</div>";
   html += "</div>";
   html += "</div>";
-  html += "<div class=\"refresh-info\">页面每10秒自动刷新</div>";
+  html += "<div class=\"status-bar\">";
+  html += "<span>📡 在线</span>";
+  html += "<span style=\"margin: 0 10px;\">|</span>";
+  html += "<span>页面每10秒自动刷新</span>";
+  html += "</div>";
   html += "</div></body></html>";
 
   server.send(200, "text/html", html);
@@ -421,9 +456,25 @@ void checkPIRSensor() {
  * 程序启动时执行一次，用于初始化所有硬件和设置
  */
 void setup() {
+  // ==================== 立即启动看门狗（最高优先级）====================
+  esp_task_wdt_init(30, true);                             // 30秒超时,panic模式(系统重启)
+  esp_task_wdt_add(NULL);                                  // 注册当前任务到看门狗(必须!)
+  
   // 初始化串口通信
   Serial.begin(115200);                                    // 设置串口波特率为115200
-                                                            // 用于向电脑输出调试信息
+  delay(100);                                              // 等待串口稳定
+  esp_task_wdt_reset();                                      // 喂狗
+  
+  // 输出启动信息
+  Serial.println("\n========================================");
+  Serial.println("ESP32 Temperature & Humidity Monitor");
+  Serial.println("========================================");
+  Serial.print("Reset reason: ");
+  Serial.println(esp_reset_reason());
+  Serial.print("Free heap at startup: ");
+  Serial.print(ESP.getFreeHeap());
+  Serial.println(" bytes");
+  esp_task_wdt_reset();                                      // 喂狗
 
   // 初始化PIR传感器
   pinMode(PIR_SENSOR_PIN, INPUT);                          // 设置PIR引脚为输入
@@ -438,20 +489,50 @@ void setup() {
   lastMotionTime = millis();
   Serial.println("PIR lastMotionTime initialized to " + String(lastMotionTime));
 
-  // 初始化OLED显示屏（U8g2版本）
-  display.begin();                                          // 初始化U8g2显示屏
+  // 初始化OLED显示屏（U8g2版本），添加I2C超时保护
+  esp_task_wdt_reset();                                      // 喂狗
+  unsigned long oledTimeout = millis();
+  bool oledInitSuccess = false;
+  
+  // OLED初始化最多等待3秒
+  while(millis() - oledTimeout < 3000 && !oledInitSuccess) {
+    esp_task_wdt_reset();
+    display.begin();  // 直接调用，不支持try-catch
+    oledInitSuccess = true;
+  }
+  
+  if(!oledInitSuccess) {
+    Serial.println("WARNING: OLED init timeout, continuing without display");
+  }
+  
   display.clearBuffer();                                   // 清空显示缓冲区
 
-  // 初始化温湿度传感器
+  // 初始化温湿度传感器，添加I2C超时保护
+  esp_task_wdt_reset();
   ahtWire.begin(AHT20_SDA, AHT20_SCL, 400000);  // 初始化第二个I2C总线
-  if (!aht.begin(&ahtWire, 0x38)) {               // 使用自定义Wire，地址0x38
-    Serial.println("AHT20 initialization failed!");
+  
+  unsigned long ahtTimeout = millis();
+  bool ahtInitSuccess = false;
+  
+  // AHT20初始化最多等待3秒
+  while(millis() - ahtTimeout < 3000 && !ahtInitSuccess) {
+    esp_task_wdt_reset();
+    if (aht.begin(&ahtWire, 0x38)) {               // 使用自定义Wire，地址0x38
+      ahtInitSuccess = true;
+    } else {
+      delay(100);
+    }
+  }
+  
+  if(!ahtInitSuccess) {
+    Serial.println("WARNING: AHT20 init timeout, continuing without sensor");
     display.clearBuffer();
     display.setFont(u8g2_font_ncenB08_tr);
     display.drawStr(0, 15, "Sensor Error!");
-    display.drawStr(0, 30, "Check AHT20");
+    display.drawStr(0, 30, "No AHT20");
     display.sendBuffer();
-    delay(2000);
+    esp_task_wdt_reset();
+    delay(1000);  // 缩短延迟并喂狗
   } else {
     Serial.println("AHT20 initialized successfully");
     Serial.print("AHT20 I2C: SDA=GPIO");
@@ -465,16 +546,13 @@ void setup() {
     display.setFont(u8g2_font_ncenB08_tr);
     display.drawStr(0, 15, "Sensor Warming...");
     display.sendBuffer();
+    esp_task_wdt_reset();
     delay(500);  // 预热0.5秒（缩短延迟）
   }
 
-  // ==================== 启动看门狗 ====================
-  // 启用任务看门狗,超时时间30秒
-  esp_task_wdt_init(30, true);                             // 30秒超时,panic模式(系统重启)
-  esp_task_wdt_add(NULL);                                  // 注册当前任务到看门狗(必须!)
-  Serial.println("Watchdog enabled and task registered (30s timeout)");
-
-  // 连接WiFi网络
+  // ==================== 连接WiFi网络 ====================
+  // 添加WiFi连接超时保护（最多等待30秒）
+  esp_task_wdt_reset();
   WiFi.begin(ssid, password);                             // 开始连接WiFi
 
   Serial.print("Connecting to WiFi");                      // 串口输出连接信息
@@ -483,25 +561,42 @@ void setup() {
   display.drawStr(0, 15, "Connecting WiFi...");           // 显示连接信息
   display.sendBuffer();                                    // 发送到OLED显示
 
+  unsigned long wifiTimeout = millis();
   while(WiFi.status() != WL_CONNECTED) {                   // 循环等待WiFi连接成功
     esp_task_wdt_reset();                                  // 喂狗,防止看门狗超时
     delay(100);                                            // 缩短延迟为100ms
     if(millis() % 500 < 100) Serial.print(".");            // 每500ms打印一个点
+    
+    // 添加WiFi连接超时保护（30秒后放弃）
+    if(millis() - wifiTimeout >= 30000) {
+      Serial.println("\nWiFi connection timeout!");
+      display.clearBuffer();
+      display.setFont(u8g2_font_ncenB08_tr);
+      display.drawStr(0, 15, "WiFi Timeout!");
+      display.drawStr(0, 30, "Will retry later");
+      display.sendBuffer();
+      esp_task_wdt_reset();
+      delay(2000);  // 显示2秒后继续（不要重启，让系统进入主循环）
+      break;  // 跳出WiFi连接等待，让主循环中的checkWiFiConnection处理
+    }
   }
-  Serial.println();                                        // 换行
-  Serial.println("WiFi connected");                        // 输出连接成功信息
-  Serial.print("IP Address: ");                           // 打印IP地址提示
-  Serial.println(WiFi.localIP());                          // 打印ESP32的IP地址
-  Serial.println("Open http://" + WiFi.localIP().toString() + " in your browser");  // 浏览器访问提示
+  if(WiFi.status() == WL_CONNECTED) {
+    Serial.println();                                        // 换行
+    Serial.println("WiFi connected");                        // 输出连接成功信息
+    Serial.print("IP Address: ");                           // 打印IP地址提示
+    Serial.println(WiFi.localIP());                          // 打印ESP32的IP地址
+    Serial.println("Open http://" + WiFi.localIP().toString() + " in your browser");  // 浏览器访问提示
 
-  // 显示WiFi连接成功和IP地址
-  display.clearBuffer();                                  // 清空缓冲区
-  display.setFont(u8g2_font_ncenB08_tr);                   // 设置字体
-  display.drawStr(0, 15, "WiFi Connected!");             // 显示连接成功
-  String ipStr = "IP: " + WiFi.localIP().toString();      // 拼接IP地址字符串
-  display.drawStr(0, 30, ipStr.c_str());                  // 显示IP地址
-  display.sendBuffer();                                   // 发送到OLED
-  delay(1000);                                             // 显示1秒让用户看到IP地址（缩短延迟）
+    // 显示WiFi连接成功和IP地址
+    display.clearBuffer();                                  // 清空缓冲区
+    display.setFont(u8g2_font_ncenB08_tr);                   // 设置字体
+    display.drawStr(0, 15, "WiFi Connected!");             // 显示连接成功
+    String ipStr = "IP: " + WiFi.localIP().toString();      // 拼接IP地址字符串
+    display.drawStr(0, 30, ipStr.c_str());                  // 显示IP地址
+    display.sendBuffer();                                   // 发送到OLED
+    esp_task_wdt_reset();  // 喂狗
+    delay(1000);                                             // 显示1秒让用户看到IP地址
+  }
 
   // 配置网络时间同步（NTP）
   // configTime用于配置ESP32的时间同步服务
@@ -537,13 +632,25 @@ void setup() {
   }
 
   // ==================== 配置静态IP ====================
-  if (WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
+  // 添加超时保护
+  esp_task_wdt_reset();
+  unsigned long configTimeout = millis();
+  bool configSuccess = false;
+  while(millis() - configTimeout < 3000 && !configSuccess) {
+    esp_task_wdt_reset();  // 持续喂狗
+    configSuccess = WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS);
+    if(!configSuccess) delay(100);
+  }
+  
+  if (configSuccess) {
     Serial.println("Static IP configured successfully");
     Serial.print("ESP32 IP: ");
     Serial.println(WiFi.localIP());
     Serial.println("External access: http://sumaj.synology.me:7788");
   } else {
-    Serial.println("Failed to configure Static IP, using DHCP");
+    Serial.println("Static IP config timeout, using DHCP-assigned IP");
+    Serial.print("Current IP: ");
+    Serial.println(WiFi.localIP());
   }
 
   // ==================== 配置Web服务器 ====================
@@ -613,8 +720,9 @@ void loop() {
       display.setFont(u8g2_font_ncenB08_tr);
       display.drawStr(0, 32, "Syncing Time...");
       display.sendBuffer();
-      delay(500);                                            // 等待0.5秒后重试
-      return;                                                // 跳过本次循环，等待下次重试
+      esp_task_wdt_reset();  // 喂狗
+      delay(500);           // 等待0.5秒后重试
+      return;             // 跳过本次循环，等待下次重试
     }
   } else {
     // 时间获取成功，保存为有效时间
@@ -627,9 +735,32 @@ void loop() {
   if(sensorUpdateCounter >= sensorUpdateInterval) {
     sensorUpdateCounter = 0;  // 重置计数器
 
-    // AHT20需要先触发测量
+    // AHT20需要先触发测量，添加I2C超时保护
+    esp_task_wdt_reset();  // 读传感器前喂狗
     sensors_event_t humidity, temp;
-    aht.getEvent(&humidity, &temp);  // 获取温度和湿度事件
+    
+    // 使用try-catch模式避免I2C死锁
+    unsigned long i2cTimeout = millis();
+    bool readSuccess = false;
+    
+    // 给I2C读取最多2秒时间，避免无限阻塞
+    while(millis() - i2cTimeout < 2000 && !readSuccess) {
+      esp_task_wdt_reset();  // 持续喂狗
+      aht.getEvent(&humidity, &temp);
+      
+      // 检查数据是否有效
+      if(!isnan(temp.temperature) && !isnan(humidity.relative_humidity)) {
+        readSuccess = true;
+      } else {
+        delay(50);  // 等待后重试
+      }
+    }
+    
+    // 如果I2C读取超时，跳过本次传感器更新
+    if(!readSuccess) {
+      Serial.println("WARNING: AHT20 I2C read timeout, skipping this update");
+      return;  // 跳过本次循环
+    }
 
     // 应用校准偏移值
     float temperature = temp.temperature + tempOffset;    // 温度校准后值（摄氏度）
@@ -653,8 +784,9 @@ void loop() {
       display.setFont(u8g2_font_ncenB08_tr);                // 设置字体
       display.drawStr(0, 15, "Sensor Error!");               // 显示传感器错误
       display.sendBuffer();                                 // 发送到OLED显示
-      delay(2000);                                           // 显示2秒
-      return;                                                // 跳过本次循环
+      esp_task_wdt_reset();  // 喂狗
+      delay(2000);          // 显示2秒
+      return;                // 跳过本次循环
     }
 
     // 更新全局变量（供Web服务器使用）
@@ -724,14 +856,19 @@ void loop() {
   }
 
   // ==================== 串口输出（调试用） ====================
-  Serial.print("Time: ");                                  // 打印"Time: "
-  Serial.print(timeStr);                                   // 打印时间字符串，如"14:30:45"
-  Serial.print("  Temp: ");                               // 打印"  Temp: "
-  Serial.print(currentTemperature, 2);                       // 打印温度值，保留2位小数，如"25.37"
-  Serial.print(" C  WiFi: ");                             // 打印WiFi状态
-  Serial.print(WiFi.status() == WL_CONNECTED ? "OK" : "LOST");  // 打印WiFi连接状态
-  Serial.print("  PIR: ");                               // 打印PIR传感器状态
-  Serial.println(digitalRead(PIR_SENSOR_PIN) == HIGH ? "HIGH" : "LOW");  // 实时读取PIR状态
+  // 添加输出缓冲检查，避免阻塞
+  if(Serial.availableForWrite() >= 100) {  // 只有缓冲区有足够空间才输出
+    Serial.print("Time: ");                                  // 打印"Time: "
+    Serial.print(timeStr);                                   // 打印时间字符串，如"14:30:45"
+    Serial.print("  Temp: ");                               // 打印"  Temp: "
+    Serial.print(currentTemperature, 1);                       // 打印温度值，保留1位小数
+    Serial.print(" C  WiFi: ");                             // 打印WiFi状态
+    Serial.print(WiFi.status() == WL_CONNECTED ? "OK" : "LOST");  // 打印WiFi连接状态
+    Serial.print("  PIR: ");                               // 打印PIR传感器状态
+    Serial.print(digitalRead(PIR_SENSOR_PIN) == HIGH ? "HIGH" : "LOW");  // 实时读取PIR状态
+    Serial.print("  FreeMem: ");                            // 打印剩余内存
+    Serial.println(ESP.getFreeHeap() / 1024);               // 打印KB为单位的内存
+  }
 
   // ==================== 处理Web请求 ====================
   // 在delay期间也要持续处理HTTP请求，避免请求堆积

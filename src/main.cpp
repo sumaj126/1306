@@ -28,9 +28,17 @@
 #include <Adafruit_AHTX0.h>            // AHT20温湿度传感器库（支持DHT20）
 #include <WiFi.h>                      // ESP32 WiFi功能库
 #include <WebServer.h>                 // ESP32 Web服务器库,用于创建HTTP服务器
+#include <PubSubClient.h>               // MQTT客户端库
 #include <time.h>                      // C标准时间库,用于时间处理
 #include <esp_task_wdt.h>              // ESP32看门狗库
 #include <esp_system.h>                // ESP32系统信息库
+
+// ==================== 核心安全配置 ====================
+#define SERIAL_TIMEOUT_MS 50          // 串口写入超时
+#define I2C_TIMEOUT_MS 2000          // I2C操作超时
+#define WIFI_TIMEOUT_MS 30000         // WiFi操作超时
+#define HTTP_TIMEOUT_MS 5000          // HTTP响应超时
+#define MAX_SERIAL_WAIT 1000          // 最大串口等待时间
 
 // ==================== OLED显示屏配置 ====================
 // 使用SSD1306驱动，I2C协议，完整帧缓冲模式
@@ -45,6 +53,24 @@ TwoWire ahtWire = TwoWire(1);  // 创建第二个I2C实例用于AHT20
 
 // 创建Web服务器对象，监听80端口（HTTP默认端口）
 WebServer server(80);
+
+// ==================== MQTT配置 ====================
+// 树莓派MQTT代理配置
+const char* mqtt_server = "192.168.1.10";  // 树莓派IP地址
+const int mqtt_port = 1883;                  // MQTT默认端口
+const char* mqtt_username = "homeassistant"; // MQTT用户名
+const char* mqtt_password = "homeassistant"; // MQTT密码
+const char* mqtt_client_id = "esp32-1306-monitor"; // MQTT客户端ID
+
+// 创建WiFi客户端和MQTT客户端
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// ==================== 预分配缓冲区（避免内存碎片）====================
+#define HTML_BUFFER_SIZE 4096        // HTML响应缓冲区大小
+#define JSON_BUFFER_SIZE 512         // JSON响应缓冲区大小
+char htmlBuffer[HTML_BUFFER_SIZE];   // 预分配HTML缓冲区
+char jsonBuffer[JSON_BUFFER_SIZE];   // 预分配JSON缓冲区
 
 // ==================== WiFi配置 ====================
 // 注意：请修改为您的WiFi网络名称和密码
@@ -90,6 +116,200 @@ bool lastPirState = false;            // 上次PIR传感器状态
 int sensorUpdateCounter = 0;             // 传感器更新计数器
 const int sensorUpdateInterval = 5;       // 传感器更新间隔（5次loop=5秒）
 
+// ==================== 安全串口输出函数 ====================
+/**
+ * 安全的串口输出函数，避免USB断开时阻塞
+ * 检查缓冲区空间，只有足够空间才输出
+ */
+void safeSerialPrint(const char* str) {
+  if(Serial.availableForWrite() > strlen(str)) {
+    Serial.print(str);
+  }
+}
+
+
+
+void safeSerialPrintln(const char* str) {
+  if(Serial.availableForWrite() > strlen(str) + 2) {
+    Serial.println(str);
+  }
+}
+
+// 将esp_reset_reason_t枚举转换为可读字符串
+const char* resetReasonToString(esp_reset_reason_t reason) {
+  switch(reason) {
+    case ESP_RST_UNKNOWN:  return "Unknown";
+    case ESP_RST_POWERON:  return "Power On";
+    case ESP_RST_EXT:      return "External Pin";
+    case ESP_RST_SW:       return "Software Reset";
+    case ESP_RST_PANIC:    return "Exception/Panic";
+    case ESP_RST_INT_WDT:  return "Interrupt Watchdog";
+    case ESP_RST_TASK_WDT: return "Task Watchdog";
+    case ESP_RST_WDT:      return "Other Watchdogs";
+    case ESP_RST_DEEPSLEEP:return "Deep Sleep Wake";
+    case ESP_RST_BROWNOUT: return "Brownout";
+    case ESP_RST_SDIO:     return "SDIO";
+    default:               return "Unknown Reason";
+  }
+}
+
+// ==================== MQTT函数 ====================
+
+// 函数声明
+void sendMQTTDiscovery();
+
+/**
+ * 连接到MQTT代理服务器
+ */
+void connectMQTT() {
+  // 等待WiFi连接
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  // 设置MQTT服务器
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  
+  // 增加缓冲区大小到512字节，容纳发现消息
+  mqttClient.setBufferSize(512);
+  Serial.println("Buffer size set to 512 bytes");
+  
+  // 尝试连接MQTT（使用匿名连接）
+  Serial.print("Connecting to MQTT...");
+  if (mqttClient.connect(mqtt_client_id)) {
+    Serial.println(" connected!");
+    
+    // 发布设备在线状态
+    Serial.println("Publishing availability message...");
+    if (mqttClient.publish("esp32-1306/availability", "online", true)) {
+      Serial.println("Availability message published successfully");
+    } else {
+      Serial.println("Failed to publish availability message");
+    }
+    
+    // 发送MQTT发现消息
+    Serial.println("Sending MQTT discovery messages...");
+    sendMQTTDiscovery();
+  } else {
+    Serial.print(" failed, rc=");
+    Serial.println(mqttClient.state());
+  }
+}
+
+/**
+ * 发送MQTT发现消息，让Home Assistant自动发现设备
+ */
+void sendMQTTDiscovery() {
+  Serial.println("=== Sending MQTT discovery messages ===");
+  
+  // 温度传感器发现
+  String tempDiscovery = "{";
+  tempDiscovery += "\"name\": \"ESP32-1306 Temperature\",";
+  tempDiscovery += "\"uniq_id\": \"esp32_1306_temperature\",";
+  tempDiscovery += "\"device_class\": \"temperature\",";
+  tempDiscovery += "\"unit_of_measurement\": \"°C\",";
+  tempDiscovery += "\"state_topic\": \"esp32-1306/temperature\",";
+  tempDiscovery += "\"availability_topic\": \"esp32-1306/availability\",";
+  tempDiscovery += "\"payload_available\": \"online\",";
+  tempDiscovery += "\"payload_not_available\": \"offline\",";
+  tempDiscovery += "\"device\": {";
+  tempDiscovery += "\"identifiers\": [\"esp32-1306-monitor\"],";
+  tempDiscovery += "\"name\": \"ESP32-1306 Monitor\",";
+  tempDiscovery += "\"model\": \"ESP32\",";
+  tempDiscovery += "\"manufacturer\": \"ESP32\"";
+  tempDiscovery += "}";
+  tempDiscovery += "}";
+  Serial.print("Temperature discovery: ");
+  Serial.println(tempDiscovery);
+  if (mqttClient.publish("homeassistant/sensor/esp32_1306_temperature/config", tempDiscovery.c_str(), true)) {
+    Serial.println("Temperature discovery message published successfully");
+  } else {
+    Serial.println("Failed to publish temperature discovery message");
+  }
+  
+  // 湿度传感器发现
+  String humDiscovery = "{";
+  humDiscovery += "\"name\": \"ESP32-1306 Humidity\",";
+  humDiscovery += "\"uniq_id\": \"esp32_1306_humidity\",";
+  humDiscovery += "\"device_class\": \"humidity\",";
+  humDiscovery += "\"unit_of_measurement\": \"%\",";
+  humDiscovery += "\"state_topic\": \"esp32-1306/humidity\",";
+  humDiscovery += "\"availability_topic\": \"esp32-1306/availability\",";
+  humDiscovery += "\"payload_available\": \"online\",";
+  humDiscovery += "\"payload_not_available\": \"offline\",";
+  humDiscovery += "\"device\": {";
+  humDiscovery += "\"identifiers\": [\"esp32-1306-monitor\"],";
+  humDiscovery += "\"name\": \"ESP32-1306 Monitor\",";
+  humDiscovery += "\"model\": \"ESP32\",";
+  humDiscovery += "\"manufacturer\": \"ESP32\"";
+  humDiscovery += "}";
+  humDiscovery += "}";
+  Serial.print("Humidity discovery: ");
+  Serial.println(humDiscovery);
+  if (mqttClient.publish("homeassistant/sensor/esp32_1306_humidity/config", humDiscovery.c_str(), true)) {
+    Serial.println("Humidity discovery message published successfully");
+  } else {
+    Serial.println("Failed to publish humidity discovery message");
+  }
+  
+  // 人体感应传感器发现
+  String motionDiscovery = "{";
+  motionDiscovery += "\"name\": \"ESP32-1306 Motion\",";
+  motionDiscovery += "\"uniq_id\": \"esp32_1306_motion\",";
+  motionDiscovery += "\"device_class\": \"motion\",";
+  motionDiscovery += "\"state_topic\": \"esp32-1306/motion\",";
+  motionDiscovery += "\"availability_topic\": \"esp32-1306/availability\",";
+  motionDiscovery += "\"payload_available\": \"online\",";
+  motionDiscovery += "\"payload_not_available\": \"offline\",";
+  motionDiscovery += "\"payload_on\": \"ON\",";
+  motionDiscovery += "\"payload_off\": \"OFF\",";
+  motionDiscovery += "\"device\": {";
+  motionDiscovery += "\"identifiers\": [\"esp32-1306-monitor\"],";
+  motionDiscovery += "\"name\": \"ESP32-1306 Monitor\",";
+  motionDiscovery += "\"model\": \"ESP32\",";
+  motionDiscovery += "\"manufacturer\": \"ESP32\"";
+  motionDiscovery += "}";
+  motionDiscovery += "}";
+  Serial.print("Motion discovery: ");
+  Serial.println(motionDiscovery);
+  if (mqttClient.publish("homeassistant/binary_sensor/esp32_1306_motion/config", motionDiscovery.c_str(), true)) {
+    Serial.println("Motion discovery message published successfully");
+  } else {
+    Serial.println("Failed to publish motion discovery message");
+  }
+  
+  Serial.println("=== MQTT discovery messages sent ===");
+}
+
+/**
+ * 发布传感器数据到MQTT
+ */
+void publishSensorData() {
+  // 发布温度数据
+  char tempBuffer[10];
+  snprintf(tempBuffer, sizeof(tempBuffer), "%.1f", currentTemperature);
+  mqttClient.publish("esp32-1306/temperature", tempBuffer);
+  
+  // 发布湿度数据
+  char humBuffer[10];
+  snprintf(humBuffer, sizeof(humBuffer), "%.1f", currentHumidity);
+  mqttClient.publish("esp32-1306/humidity", humBuffer);
+  
+  // 发布人体感应数据
+  int pirState = digitalRead(PIR_SENSOR_PIN);
+  mqttClient.publish("esp32-1306/motion", pirState == HIGH ? "ON" : "OFF");
+  
+  // 发布设备在线状态
+  mqttClient.publish("esp32-1306/availability", "online", true);
+}
+
+// ====================硬件级I2C超时保护 ====================
+/**
+ * 带超时的I2C读取函数，防止I2C死锁
+ * 直接调用I2C函数，使用外层while循环控制超时
+ */
+
 // ==================== 系统保护变量 ====================
 unsigned long lastWiFiCheck = 0;         // 上次检查WiFi的时间
 unsigned long lastNTPCheck = 0;          // 上次检查NTP的时间
@@ -97,6 +317,10 @@ const unsigned long wifiCheckInterval = 30000;  // WiFi检查间隔（30秒）
 const unsigned long ntpCheckInterval = 86400000;  // NTP检查间隔（24小时=一天）
 int reconnectCount = 0;                  // WiFi重连次数
 const int maxReconnectCount = 5;         // 最大重连次数后重启
+
+// ==================== 重启计数器（用于检测重启循环）====================
+RTC_DATA_ATTR int bootCount = 0;        // 存储在RTC内存，重启后保留
+const int MAX_BOOT_COUNT = 10;           // 最大重启次数，超过则进入安全模式
 
 // ==================== WiFi重连函数 ====================
 /**
@@ -267,73 +491,74 @@ void handleRoot() {
   server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  // 使用String一次性构建，减少内存碎片
-  // 样式与服务器端监控页面保持一致
-  String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\">";
-  html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">";
-  html += "<title>客厅温湿度监控</title><style>";
-  html += "* { margin: 0; padding: 0; box-sizing: border-box; }";
-  html += "body { font-family: 'Microsoft YaHei', Arial, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }";
-  html += ".container { background: white; border-radius: 20px; padding: 40px; box-shadow: 0 10px 40px rgba(0,0,0,0.1); max-width: 500px; width: 100%; }";
-  html += ".header { text-align: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 2px solid #f0f0f0; }";
-  html += ".title { font-size: 28px; color: #333; margin-bottom: 10px; font-weight: bold; }";
-  html += ".subtitle { font-size: 14px; color: #999; }";
-  html += ".time-display { text-align: center; font-size: 48px; font-weight: bold; color: #667eea; margin-bottom: 30px; font-family: 'Courier New', monospace; }";
-  html += ".data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }";
-  html += ".data-card { border-radius: 15px; padding: 25px; text-align: center; color: #333; }";
-  html += ".data-label { font-size: 16px; opacity: 0.9; margin-bottom: 10px; }";
-  html += ".data-value { font-size: 42px; font-weight: bold; }";
-  html += ".status-bar { background: #f8f9fa; border-radius: 10px; padding: 15px; text-align: center; font-size: 14px; color: #666; }";
-  html += ".icon { font-size: 32px; margin-bottom: 10px; }";
-  html += "@media (max-width: 480px) { .container { padding: 20px; } .title { font-size: 24px; } .time-display { font-size: 36px; } .data-card { padding: 15px; text-align: center; } .data-value { font-size: 32px; text-align: center; } }";
-  html += "</style><script>";
-
-  // JavaScript：动态更新时间和刷新页面
-  html += "function updateTime() {";
-  html += "  const now = new Date();";
-  html += "  const hours = String(now.getHours()).padStart(2, '0');";
-  html += "  const minutes = String(now.getMinutes()).padStart(2, '0');";
-  html += "  const seconds = String(now.getSeconds()).padStart(2, '0');";
-  html += "  document.getElementById('time').textContent = hours + ':' + minutes + ':' + seconds;";
-  html += "}";
-
-  // 根据温度设置颜色
-  html += "const temperature = " + String(currentTemperature, 1) + ";";
-  html += "let tempColor = temperature < 20 ? '#3498db' : (temperature >= 20 && temperature < 30 ? 'rgb(241,196,15)' : '#e74c3c');";
-  html += "const humColor = '#28a745';";
-  html += "document.addEventListener('DOMContentLoaded', function() {";
-  html += "  document.getElementById('temp-value').style.color = tempColor;";
-  html += "  document.getElementById('hum-value').style.color = humColor;";
-  html += "});";
-  html += "setInterval(updateTime, 1000);";
-  html += "setInterval(() => location.reload(), 10000);";
-  html += "window.onload = updateTime;";
-
-  html += "</script></head><body><div class=\"container\">";
-  html += "<div class=\"header\">";
-  html += "<div class=\"icon\">🏠</div>";
-  html += "<div class=\"title\">客厅温湿度监控</div>";
-  html += "<div class=\"subtitle\">Living Room Monitor</div>";
-  html += "</div>";
-  html += "<div class=\"time-display\" id=\"time\">" + String(currentTime) + "</div>";
-  html += "<div class=\"data-grid\">";
-  html += "<div class=\"data-card\">";
-  html += "<div class=\"data-label\">🌡️ 温度</div>";
-  html += "<div class=\"data-value\" id=\"temp-value\">" + String(currentTemperature, 1) + "°C</div>";
-  html += "</div>";
-  html += "<div class=\"data-card\">";
-  html += "<div class=\"data-label\">💧 湿度</div>";
-  html += "<div class=\"data-value\" id=\"hum-value\">" + String(currentHumidity, 1) + "%</div>";
-  html += "</div>";
-  html += "</div>";
-  html += "<div class=\"status-bar\">";
-  html += "<span>📡 在线</span>";
-  html += "<span style=\"margin: 0 10px;\">|</span>";
-  html += "<span>页面每10秒自动刷新</span>";
-  html += "</div>";
-  html += "</div></body></html>";
-
-  server.send(200, "text/html", html);
+  // 使用预分配缓冲区，避免内存碎片
+  int len = snprintf(htmlBuffer, HTML_BUFFER_SIZE,
+    "<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
+    "<title>客厅温湿度监控</title><style>"
+    "* { margin: 0; padding: 0; box-sizing: border-box; }"
+    "body { font-family: 'Microsoft YaHei', Arial, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }"
+    ".container { background: white; border-radius: 20px; padding: 40px; box-shadow: 0 10px 40px rgba(0,0,0,0.1); max-width: 500px; width: 100%%; }"
+    ".header { text-align: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 2px solid #f0f0f0; }"
+    ".title { font-size: 28px; color: #333; margin-bottom: 10px; font-weight: bold; }"
+    ".subtitle { font-size: 14px; color: #999; }"
+    ".time-display { text-align: center; font-size: 48px; font-weight: bold; color: #667eea; margin-bottom: 30px; font-family: 'Courier New', monospace; }"
+    ".data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }"
+    ".data-card { border-radius: 15px; padding: 25px; text-align: center; color: #333; }"
+    ".data-label { font-size: 16px; opacity: 0.9; margin-bottom: 10px; }"
+    ".data-value { font-size: 42px; font-weight: bold; }"
+    ".status-bar { background: #f8f9fa; border-radius: 10px; padding: 15px; text-align: center; font-size: 14px; color: #666; }"
+    ".icon { font-size: 32px; margin-bottom: 10px; }"
+    "@media (max-width: 480px) { .container { padding: 20px; } .title { font-size: 24px; } .time-display { font-size: 36px; } .data-card { padding: 15px; text-align: center; } .data-value { font-size: 32px; text-align: center; } }"
+    "</style><script>"
+    "function updateTime() {"
+    "  const now = new Date();"
+    "  const hours = String(now.getHours()).padStart(2, '0');"
+    "  const minutes = String(now.getMinutes()).padStart(2, '0');"
+    "  const seconds = String(now.getSeconds()).padStart(2, '0');"
+    "  document.getElementById('time').textContent = hours + ':' + minutes + ':' + seconds;"
+    "}"
+    "const temperature = %.1f;"
+    "let tempColor = temperature < 20 ? '#3498db' : (temperature >= 20 && temperature < 30 ? 'rgb(241,196,15)' : '#e74c3c');"
+    "const humColor = '#28a745';"
+    "document.addEventListener('DOMContentLoaded', function() {"
+    "  document.getElementById('temp-value').style.color = tempColor;"
+    "  document.getElementById('hum-value').style.color = humColor;"
+    "});"
+    "setInterval(updateTime, 1000);"
+    "setInterval(() => location.reload(), 10000);"
+    "window.onload = updateTime;"
+    "</script></head><body><div class=\"container\">"
+    "<div class=\"header\">"
+    "<div class=\"icon\">🏠</div>"
+    "<div class=\"title\">客厅温湿度监控</div>"
+    "<div class=\"subtitle\">Living Room Monitor</div>"
+    "</div>"
+    "<div class=\"time-display\" id=\"time\">%s</div>"
+    "<div class=\"data-grid\">"
+    "<div class=\"data-card\">"
+    "<div class=\"data-label\">🌡️ 温度</div>"
+    "<div class=\"data-value\" id=\"temp-value\">%.1f°C</div>"
+    "</div>"
+    "<div class=\"data-card\">"
+    "<div class=\"data-label\">💧 湿度</div>"
+    "<div class=\"data-value\" id=\"hum-value\">%.1f%%</div>"
+    "</div>"
+    "</div>"
+    "<div class=\"status-bar\">"
+    "<span>📡 在线</span>"
+    "<span style=\"margin: 0 10px;\">|</span>"
+    "<span>页面每10秒自动刷新</span>"
+    "</div>"
+    "</div></body></html>",
+    currentTemperature, currentTime, currentTemperature, currentHumidity
+  );
+  
+  if(len > 0 && len < HTML_BUFFER_SIZE) {
+    server.send(200, "text/html", htmlBuffer);
+  } else {
+    server.send(500, "text/plain", "HTML generation error");
+  }
 }
 
 /**
@@ -347,7 +572,8 @@ void handleTemperature() {
   server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  String tempText = String(currentTemperature, 1) + "°C";  // 格式化温度为字符串，如"25.3°C"
+  char tempText[32];
+  snprintf(tempText, sizeof(tempText), "%.1f°C", currentTemperature);
   server.send(200, "text/plain", tempText);                // 发送纯文本响应
 }
 
@@ -362,7 +588,8 @@ void handleHumidity() {
   server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  String humText = String(currentHumidity, 1) + "%";       // 格式化湿度为字符串，如"65.2%"
+  char humText[32];
+  snprintf(humText, sizeof(humText), "%.1f%%", currentHumidity);
   server.send(200, "text/plain", humText);                 // 发送纯文本响应
 }
 
@@ -377,15 +604,16 @@ void handleJson() {
   server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  String json = "{";                                       // JSON开始
-  json += "\"temperature\": " + String(currentTemperature, 1) + ",";  // 温度值
-  json += "\"humidity\": " + String(currentHumidity, 1) + ",";       // 湿度值
-  json += "\"time\": \"" + String(currentTime) + "\",";     // 时间字符串
-  json += "\"date\": \"" + String(currentDate) + "\",";     // 日期字符串
-  json += "\"status\": \"ok\"";                             // 状态
-  json += "}";                                              // JSON结束
-
-  server.send(200, "application/json", json);             // 发送JSON响应
+  int len = snprintf(jsonBuffer, JSON_BUFFER_SIZE,
+    "{\"temperature\": %.1f,\"humidity\": %.1f,\"time\": \"%s\",\"date\": \"%s\",\"status\": \"ok\"}",
+    currentTemperature, currentHumidity, currentTime, currentDate
+  );
+  
+  if(len > 0 && len < JSON_BUFFER_SIZE) {
+    server.send(200, "application/json", jsonBuffer);
+  } else {
+    server.send(500, "text/plain", "JSON generation error");
+  }
 }
 
 /**
@@ -393,14 +621,15 @@ void handleJson() {
  * 当访问不存在的路径时调用此函数
  */
 void handleNotFound() {
-  String message = "404 Not Found\n\n";                    // 错误信息
-  message += "URI: " + server.uri() + "\n";                // 访问的URI
-  message += "Method: " + String((server.method() == HTTP_GET) ? "GET" : "POST") + "\n";  // 请求方法
-  message += "Arguments: " + String(server.args()) + "\n"; // 参数数量
-  for (uint8_t i = 0; i < server.args(); i++) {            // 遍历所有参数
-    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";  // 参数名和值
-  }
-  server.send(404, "text/plain", message);                 // 发送404错误响应
+  char notFoundBuffer[512];
+  int len = snprintf(notFoundBuffer, sizeof(notFoundBuffer),
+    "404 Not Found\n\nURI: %s\nMethod: %s\nArguments: %d",
+    server.uri().c_str(),
+    (server.method() == HTTP_GET) ? "GET" : "POST",
+    server.args()
+  );
+  
+  server.send(404, "text/plain", notFoundBuffer);
 }
 
 // ==================== PIR传感器控制函数 ====================
@@ -466,14 +695,39 @@ void setup() {
   esp_task_wdt_reset();                                      // 喂狗
   
   // 输出启动信息
-  Serial.println("\n========================================");
-  Serial.println("ESP32 Temperature & Humidity Monitor");
-  Serial.println("========================================");
-  Serial.print("Reset reason: ");
-  Serial.println(esp_reset_reason());
-  Serial.print("Free heap at startup: ");
+  safeSerialPrintln("\n========================================");
+  safeSerialPrintln("ESP32 Temperature & Humidity Monitor");
+  safeSerialPrintln("========================================");
+  safeSerialPrint("Reset reason: ");
+  safeSerialPrintln(resetReasonToString(esp_reset_reason()));
+  safeSerialPrint("Free heap at startup: ");
   Serial.print(ESP.getFreeHeap());
-  Serial.println(" bytes");
+  safeSerialPrintln(" bytes");
+  
+  // 检测重启循环
+  bootCount++;
+  safeSerialPrint("Boot count: ");
+  Serial.println(bootCount);
+  
+  if(bootCount > MAX_BOOT_COUNT) {
+    safeSerialPrintln("CRITICAL: Too many reboots! Entering safe mode...");
+    safeSerialPrintln("Please check hardware connections and restart manually.");
+    
+    // 进入安全模式：禁用看门狗，停止所有操作
+    esp_task_wdt_delete(NULL);  // 删除看门狗
+    
+    display.clearBuffer();
+    display.setFont(u8g2_font_ncenB08_tr);
+    display.drawStr(0, 15, "SAFE MODE");
+    display.drawStr(0, 30, "Check HW!");
+    display.sendBuffer();
+    
+    // 永久循环等待手动干预
+    while(true) {
+      delay(1000);
+    }
+  }
+  
   esp_task_wdt_reset();                                      // 喂狗
 
   // 初始化PIR传感器
@@ -664,6 +918,9 @@ void setup() {
   Serial.println("HTTP server started");                   // 输出服务器启动成功信息
   Serial.println("Web server running on http://" + WiFi.localIP().toString());  // 显示服务器地址
 
+  // 连接MQTT
+  connectMQTT();
+
   display.clearBuffer();                                  // 清空OLED准备进入主循环显示
   display.setFont(u8g2_font_ncenB08_tr);                  // 设置字体
   display.drawStr(0, 32, "Starting...");                // 显示启动状态
@@ -687,6 +944,12 @@ void loop() {
   checkNTPSync();                                         // 定期同步NTP时间
   checkMemory();                                           // 监控剩余内存
   checkPIRSensor();                                        // 检查PIR传感器状态
+  
+  // ==================== MQTT客户端循环 ====================
+  if (!mqttClient.connected()) {
+    connectMQTT();
+  }
+  mqttClient.loop();
 
   // ==================== 获取时间 ====================
   struct tm timeinfo;                                      // 定义时间结构体变量
@@ -792,6 +1055,15 @@ void loop() {
     // 更新全局变量（供Web服务器使用）
     currentTemperature = temperature;                       // 保存当前温度值
     currentHumidity = hum;                               // 保存当前湿度值
+    
+    // 发布传感器数据到MQTT（每次读取后）
+    publishSensorData();
+    
+    // 发布传感器数据到MQTT（每次读取后）
+    publishSensorData();
+    
+    // 发布传感器数据到MQTT（每次读取后）
+    publishSensorData();
   }
 
   // ==================== 更新时间和日期（每次循环都更新） ====================
@@ -856,25 +1128,26 @@ void loop() {
   }
 
   // ==================== 串口输出（调试用） ====================
-  // 添加输出缓冲检查，避免阻塞
-  if(Serial.availableForWrite() >= 100) {  // 只有缓冲区有足够空间才输出
-    Serial.print("Time: ");                                  // 打印"Time: "
-    Serial.print(timeStr);                                   // 打印时间字符串，如"14:30:45"
-    Serial.print("  Temp: ");                               // 打印"  Temp: "
-    Serial.print(currentTemperature, 1);                       // 打印温度值，保留1位小数
-    Serial.print(" C  WiFi: ");                             // 打印WiFi状态
-    Serial.print(WiFi.status() == WL_CONNECTED ? "OK" : "LOST");  // 打印WiFi连接状态
-    Serial.print("  PIR: ");                               // 打印PIR传感器状态
-    Serial.print(digitalRead(PIR_SENSOR_PIN) == HIGH ? "HIGH" : "LOW");  // 实时读取PIR状态
-    Serial.print("  FreeMem: ");                            // 打印剩余内存
-    Serial.println(ESP.getFreeHeap() / 1024);               // 打印KB为单位的内存
+  // 使用安全串口输出，避免阻塞
+  char debugBuffer[128];
+  int len = snprintf(debugBuffer, sizeof(debugBuffer),
+    "Time: %s  Temp: %.1f C  WiFi: %s  PIR: %s  FreeMem: %dKB",
+    timeStr, currentTemperature,
+    WiFi.status() == WL_CONNECTED ? "OK" : "LOST",
+    digitalRead(PIR_SENSOR_PIN) == HIGH ? "HIGH" : "LOW",
+    ESP.getFreeHeap() / 1024
+  );
+  
+  if(len > 0 && len < sizeof(debugBuffer)) {
+    safeSerialPrintln(debugBuffer);
   }
 
-  // ==================== 处理Web请求 ====================
-  // 在delay期间也要持续处理HTTP请求，避免请求堆积
+  // ==================== 处理Web请求和MQTT消息 ====================
+  // 在delay期间也要持续处理HTTP请求和MQTT消息，避免请求堆积
   unsigned long delayStart = millis();
   while(millis() - delayStart < 1000) {
     server.handleClient();  // 持续处理HTTP请求
+    mqttClient.loop();      // 处理MQTT消息
     delay(10);  // 短暂延迟，避免CPU占用过高
   }
 }

@@ -1,0 +1,14 @@
+{
+  "name": "espressif32",
+  "title": "Espressif 32",
+  "version": "55.03.37",
+  "packages": {
+    "tool-esp_install": {
+      "type": "tool",
+      "optional": true,
+      "owner": "pioarduino",
+      "package-version": "5.3.4",
+      "version": "https://github.com/pioarduino/esp_install/releases/download/v5.3.4/esp_install-v5.3.4.zip"
+    }
+  }
+}

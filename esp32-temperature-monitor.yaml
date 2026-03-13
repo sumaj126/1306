@@ -1,0 +1,193 @@
+# ESP32温湿度监控系统 - ESPHome配置
+# 实现与原始代码相同的所有功能
+
+esphome:
+  name: esp32-temperature-monitor
+  on_boot:
+    then:
+      - lambda: |
+          // 初始化屏幕状态
+          id(screen_on) = true;
+
+# 平台配置
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# WiFi配置
+wifi:
+  ssid: "jiajia"
+  password: "9812061104"
+  manual_ip:
+    static_ip: 192.168.1.200
+    gateway: 192.168.1.1
+    subnet: 255.255.255.0
+    dns1: 192.168.1.1
+    dns2: 8.8.8.8
+  # WiFi重连配置
+  power_save_mode: none
+  reboot_timeout: 15min
+
+# 启用Web服务器
+web_server:
+  port: 80
+
+# 启用API和OTA
+api:
+  encryption:
+    key: "cD9kxviHRBXh1PHnWBxAaijqiSnP93X7+SdgtSW5nvI="
+
+ota:
+  platform: esphome
+  password: "esp32123"
+
+# 启用日志
+logger:
+  level: INFO
+
+# 启用debug组件
+debug:
+
+# 时间同步
+time:
+  - platform: sntp
+    id: my_time
+    servers:
+      - cn.pool.ntp.org
+    timezone: Asia/Shanghai
+
+# I2C总线配置
+i2c:
+  - id: i2c_bus0
+    sda: 21
+    scl: 22
+    frequency: 400kHz
+  - id: i2c_bus1
+    sda: 4
+    scl: 5
+    frequency: 400kHz
+
+# 温湿度传感器
+sensor:
+  # AHT20温湿度传感器
+  - platform: aht10
+    i2c_id: i2c_bus1
+    address: 0x38
+    temperature:
+      name: "Temperature"
+      id: temperature_sensor
+      accuracy_decimals: 1
+      filters:
+        - offset: -1.0  # 温度校准偏移
+    humidity:
+      name: "Humidity"
+      id: humidity_sensor
+      accuracy_decimals: 1
+      filters:
+        - offset: 3.0  # 湿度校准偏移
+    update_interval: 5s
+  
+  # 内存监控
+  - platform: debug
+    free: 
+      name: "Free Memory"
+      id: free_heap
+
+# PIR人体感应传感器
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: 13
+      mode: INPUT
+    name: "人体感应"
+    id: pir_sensor
+    device_class: motion
+    on_press:
+      then:
+        - lambda: |
+            id(last_motion_time) = id(my_time).now().timestamp;
+            id(screen_on) = true;
+    on_release:
+      then:
+        - lambda: |
+            id(last_motion_time) = id(my_time).now().timestamp;
+
+# 屏幕控制
+switch:
+  - platform: template
+    name: "屏幕状态"
+    id: screen_power
+    turn_on_action:
+      - lambda: |
+          id(screen_on) = true;
+    turn_off_action:
+      - lambda: |
+          id(screen_on) = false;
+
+# 全局变量
+globals:
+  - id: screen_on
+    type: bool
+    initial_value: "true"
+  - id: last_motion_time
+    type: int
+    initial_value: "0"
+
+# OLED显示屏
+display:
+  - platform: ssd1306_i2c
+    id: oled_display
+    i2c_id: i2c_bus0
+    model: "SSD1306 128x64"
+    address: 0x3C
+    lambda: |
+      // 检查是否需要熄屏
+      if (id(my_time).now().timestamp - id(last_motion_time) > 60) {
+        id(screen_on) = false;
+      }
+      
+      if (id(screen_on)) {
+        // 亮屏状态
+        it.clear();
+        
+        // 显示PIR状态图标
+        if (id(pir_sensor).state) {
+          // 有人状态
+          it.printf(0, 10, "MOTION");
+        } else {
+          // 无人状态
+          it.printf(0, 10, "NO MOTION");
+        }
+        
+        // 显示日期
+        char date_str[16];
+        time_t now = id(my_time).now().timestamp;
+        struct tm *timeinfo = localtime(&now);
+        strftime(date_str, sizeof(date_str), "%Y-%m-%d", timeinfo);
+        it.printf(0, 20, "%s", date_str);
+        
+        // 显示时间
+        char time_str[16];
+        strftime(time_str, sizeof(time_str), "%H:%M:%S", timeinfo);
+        it.printf(0, 35, "%s", time_str);
+        
+        // 显示温湿度
+        char temp_str[20];
+        char hum_str[20];
+        snprintf(temp_str, sizeof(temp_str), "T: %.1fC", id(temperature_sensor).state);
+        snprintf(hum_str, sizeof(hum_str), "H: %.1f%%", id(humidity_sensor).state);
+        it.printf(0, 50, "%s %s", temp_str, hum_str);
+      } else {
+        // 熄屏状态
+        it.clear();
+      }
+
+# 健康检查
+text_sensor:
+  - platform: template
+    name: "系统状态"
+    id: system_status
+    lambda: |
+      return {"online"};
+    update_interval: 60s
